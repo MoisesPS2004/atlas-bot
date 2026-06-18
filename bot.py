@@ -208,7 +208,7 @@ def _call_grok(user_id: int, user_type: str, internal_id: int | str) -> str:
 
     for iteration in range(_MAX_TOOL_ITER):
         response = _client.chat.completions.create(
-            model="x-ai/grok-3",
+            model="x-ai/grok-4.3",
             messages=messages,
             tools=TOOLS,
             tool_choice="auto",
