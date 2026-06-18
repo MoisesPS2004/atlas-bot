@@ -371,7 +371,7 @@ def _add_to_history(user_id: int, role: str, content: str) -> None:
 # ─── Grok call ────────────────────────────────────────────────────────────────
 async def _call_grok(user_id: int, user_type: str, internal_id: int | str, context) -> str:
     """Run the agentic loop. Returns final text reply."""
-    system = SOUL + f"\n\n---\nCurrent user: {user_type} (internal_id={internal_id})"
+    system = SOUL + f"\n\n---\nCurrent user: {user_type} (internal_id={internal_id}, telegram_id={user_id})"
     messages = [{"role": "system", "content": system}] + _history[user_id]
 
     for iteration in range(_MAX_TOOL_ITER):
