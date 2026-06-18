@@ -264,6 +264,17 @@ TOOLS = [
     },
 ]
 
+_ADMIN_ONLY_TOOLS = {
+    "generate_draft",
+    "delete_draft",
+    "approve_draft",
+    "deactivate_volunteer",
+    "update_volunteer_dates",
+    "list_volunteers",
+    "confirm_training",
+    "report_no_show",
+}
+
 async def _notify_admins_tool(message: str, context, acting_user_id: int = 0) -> str:
     """Send a notification to all admins except the one currently acting. Used as a tool by Grok."""
     admin_ids = _load_admin_ids()
@@ -394,6 +405,15 @@ async def _call_grok(user_id: int, user_type: str, internal_id: int | str, conte
         ]})
         for tc in msg.tool_calls:
             tool_args = json.loads(tc.function.arguments)
+            # Enforce admin-only tools
+            if user_type == "volunteer" and tc.function.name in _ADMIN_ONLY_TOOLS:
+                logger.warning(f"Volunteer {user_id} attempted admin tool {tc.function.name} — blocked")
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": json.dumps({"ok": False, "error": "permission denied: this action is for admins only"}),
+                })
+                continue
             if tc.function.name == "notify_admins":
                 tool_result = await _notify_admins_tool(
                     tool_args.get("message", ""), context, acting_user_id=user_id
