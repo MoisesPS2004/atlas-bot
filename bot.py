@@ -147,6 +147,23 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_draft",
+            "description": "Delete an existing draft for a week so it can be regenerated. Only works on drafts not yet published. Use when a draft needs to be recreated after changes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "week": {
+                        "type": "string",
+                        "description": "Monday of the week in YYYY-MM-DD format"
+                    }
+                },
+                "required": ["week"],
+            },
+        },
+    },
 ]
 
 # ─── Engine tool runner ───────────────────────────────────────────────────────
@@ -165,6 +182,7 @@ def _run_tool(name: str, args: dict) -> str:
         "show_volunteer":    ["show-volunteer",
                               *(["--telegram-id", args.get("telegram_id")] if args.get("telegram_id") else []),
                               *(["--name",        args.get("name")]        if args.get("name")        else [])],
+        "delete_draft":      ["delete-draft", "--week", args.get("week", "")],
     }
     if name not in cmd_map:
         return json.dumps({"ok": False, "error": f"unknown tool: {name}"})
