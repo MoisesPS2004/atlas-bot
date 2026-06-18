@@ -164,7 +164,120 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "notify_admins",
+            "description": "Send a notification message to all admins (Moises, Marielle, Thibaut). Use this when escalating issues, flagging problems, or confirming important actions. Always use this instead of just saying you will notify someone.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "The message to send to all admins"
+                    }
+                },
+                "required": ["message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_volunteers",
+            "description": "List all registered volunteers with their names, arrival/departure dates, and internal IDs. Use when an admin asks who is at the hostel or registered.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "active_only": {
+                        "type": "string",
+                        "enum": ["true", "false"],
+                        "description": "true = active volunteers only (default), false = include inactive"
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "deactivate_volunteer",
+            "description": "Deactivate a volunteer, cancelling all their future shifts. Use when a volunteer leaves early or cancels their stay.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "volunteer_id": {
+                        "type": "integer",
+                        "description": "The volunteer's internal ID"
+                    }
+                },
+                "required": ["volunteer_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "approve_draft",
+            "description": "Approve the weekly schedule draft and publish it. Returns the list of volunteers and their shifts to notify. Call this only when an admin explicitly approves.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "week": {
+                        "type": "string",
+                        "description": "Monday of the week in YYYY-MM-DD format"
+                    },
+                    "telegram_id": {
+                        "type": "string",
+                        "description": "Telegram ID of the approving admin"
+                    }
+                },
+                "required": ["week", "telegram_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_volunteer_dates",
+            "description": "Update a volunteer's arrival or departure dates. Cancels future shifts outside the new window. Use for extensions, early departures, or date corrections.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "stay_id": {
+                        "type": "integer",
+                        "description": "The stay's internal ID"
+                    },
+                    "arrival": {
+                        "type": "string",
+                        "description": "New arrival date YYYY-MM-DD (optional)"
+                    },
+                    "departure": {
+                        "type": "string",
+                        "description": "New departure date YYYY-MM-DD (optional)"
+                    }
+                },
+                "required": ["stay_id"],
+            },
+        },
+    },
 ]
+
+async def _notify_admins_tool(message: str, context) -> str:
+    """Send a notification to all admins. Used as a tool by Grok."""
+    admin_ids = _load_admin_ids()
+    sent = 0
+    for admin_id in admin_ids:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=f"Atlas notification:\n\n{message}",
+            )
+            sent += 1
+        except Exception as e:
+            logger.error(f"Could not notify admin {admin_id}: {e}")
+    return json.dumps({"ok": True, "notified": sent})
 
 # ─── Engine tool runner ───────────────────────────────────────────────────────
 def _run_tool(name: str, args: dict) -> str:
@@ -183,6 +296,17 @@ def _run_tool(name: str, args: dict) -> str:
                               *(["--telegram-id", args.get("telegram_id")] if args.get("telegram_id") else []),
                               *(["--name",        args.get("name")]        if args.get("name")        else [])],
         "delete_draft":      ["delete-draft", "--week", args.get("week", "")],
+        "list_volunteers":   ["list-volunteers",
+                              *(["--active-only", args.get("active_only", "true")])],
+        "deactivate_volunteer": ["deactivate-volunteer",
+                                  "--volunteer", str(args.get("volunteer_id", ""))],
+        "approve_draft":     ["approve-draft",
+                               "--week",        args.get("week", ""),
+                               "--telegram-id", args.get("telegram_id", "")],
+        "update_volunteer_dates": ["update-volunteer-dates",
+                                    "--stay-id",   str(args.get("stay_id", "")),
+                                    *(["--arrival",   args.get("arrival")]   if args.get("arrival")   else []),
+                                    *(["--departure", args.get("departure")] if args.get("departure") else [])],
     }
     if name not in cmd_map:
         return json.dumps({"ok": False, "error": f"unknown tool: {name}"})
@@ -243,7 +367,7 @@ def _add_to_history(user_id: int, role: str, content: str) -> None:
         _history[user_id] = _history[user_id][-_MAX_HISTORY:]
 
 # ─── Grok call ────────────────────────────────────────────────────────────────
-def _call_grok(user_id: int, user_type: str, internal_id: int | str) -> str:
+async def _call_grok(user_id: int, user_type: str, internal_id: int | str, context) -> str:
     """Run the agentic loop. Returns final text reply."""
     system = SOUL + f"\n\n---\nCurrent user: {user_type} (internal_id={internal_id})"
     messages = [{"role": "system", "content": system}] + _history[user_id]
@@ -268,7 +392,12 @@ def _call_grok(user_id: int, user_type: str, internal_id: int | str) -> str:
         ]})
         for tc in msg.tool_calls:
             tool_args = json.loads(tc.function.arguments)
-            tool_result = _run_tool(tc.function.name, tool_args)
+            if tc.function.name == "notify_admins":
+                tool_result = await _notify_admins_tool(
+                    tool_args.get("message", ""), context
+                )
+            else:
+                tool_result = _run_tool(tc.function.name, tool_args)
             logger.info(f"Tool {tc.function.name} result: {tool_result[:200]}")
             messages.append({
                 "role": "tool",
@@ -298,7 +427,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Add to history and call Grok
     _add_to_history(user_id, "user", text)
     try:
-        reply = _call_grok(user_id, user_type, internal_id)
+        reply = await _call_grok(user_id, user_type, internal_id, context)
     except Exception as e:
         logger.error(f"Grok call failed for user {user_id}: {e}")
         reply = "Something went wrong on my end. Please try again in a moment."
