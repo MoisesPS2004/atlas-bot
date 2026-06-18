@@ -126,6 +126,27 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "show_volunteer",
+            "description": "Look up a volunteer by name or Telegram ID to get their internal volunteer_id. Use this before calling any tool that requires a volunteer_id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "telegram_id": {
+                        "type": "string",
+                        "description": "The volunteer's Telegram ID (optional if name is provided)"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "The volunteer's name or partial name (optional if telegram_id is provided)"
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
 ]
 
 # ─── Engine tool runner ───────────────────────────────────────────────────────
@@ -141,6 +162,9 @@ def _run_tool(name: str, args: dict) -> str:
                               "--confirmed", "true" if args.get("confirmed") else "false"],
         "report_no_show":    ["report-no-show",   "--shift",     str(args.get("shift_id", "")),
                               "--volunteer",      str(args.get("volunteer_id", ""))],
+        "show_volunteer":    ["show-volunteer",
+                              *(["--telegram-id", args.get("telegram_id")] if args.get("telegram_id") else []),
+                              *(["--name",        args.get("name")]        if args.get("name")        else [])],
     }
     if name not in cmd_map:
         return json.dumps({"ok": False, "error": f"unknown tool: {name}"})
