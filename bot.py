@@ -264,11 +264,13 @@ TOOLS = [
     },
 ]
 
-async def _notify_admins_tool(message: str, context) -> str:
-    """Send a notification to all admins. Used as a tool by Grok."""
+async def _notify_admins_tool(message: str, context, acting_user_id: int = 0) -> str:
+    """Send a notification to all admins except the one currently acting. Used as a tool by Grok."""
     admin_ids = _load_admin_ids()
     sent = 0
     for admin_id in admin_ids:
+        if admin_id == acting_user_id:
+            continue
         try:
             await context.bot.send_message(
                 chat_id=admin_id,
@@ -394,7 +396,7 @@ async def _call_grok(user_id: int, user_type: str, internal_id: int | str, conte
             tool_args = json.loads(tc.function.arguments)
             if tc.function.name == "notify_admins":
                 tool_result = await _notify_admins_tool(
-                    tool_args.get("message", ""), context
+                    tool_args.get("message", ""), context, acting_user_id=user_id
                 )
             else:
                 tool_result = _run_tool(tc.function.name, tool_args)
