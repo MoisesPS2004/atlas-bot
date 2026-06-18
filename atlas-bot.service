@@ -1,0 +1,15 @@
+[Unit]
+Description=Atlas Operations Bot
+After=network.target
+
+[Service]
+Type=simple
+User=moises
+WorkingDirectory=/home/moises/atlas-bot
+ExecStart=/home/moises/atlas-bot/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
