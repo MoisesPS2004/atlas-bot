@@ -7,7 +7,7 @@ from pathlib import Path
 
 from openai import OpenAI
 from telegram import Update
-from telegram.ext import Application, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 # ─── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -264,9 +264,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     _add_to_history(user_id, "assistant", reply)
     await update.message.reply_text(reply)
 
+async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /start, /help, /status commands with a friendly plain-text response."""
+    await update.message.reply_text(
+        "Hi! I'm Atlas, the operations assistant for Aquarela do Leme.\n"
+        "Just write me a message in plain text — no commands needed.\n"
+        "How can I help?"
+    )
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main() -> None:
     app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start",  handle_command))
+    app.add_handler(CommandHandler("help",   handle_command))
+    app.add_handler(CommandHandler("status", handle_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("Atlas bot started.")
     app.run_polling()
