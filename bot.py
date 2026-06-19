@@ -501,6 +501,7 @@ async def _call_grok(user_id: int, user_type: str, internal_id: int | str, conte
             {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
             for tc in msg.tool_calls
         ]})
+        approve_ran_this_turn = False
         for tc in msg.tool_calls:
             tool_args = json.loads(tc.function.arguments)
             # Enforce admin-only tools
@@ -527,17 +528,23 @@ async def _call_grok(user_id: int, user_type: str, internal_id: int | str, conte
                     tool_args.get("message", ""), context, acting_user_id=user_id
                 )
             elif tc.function.name == "notify_volunteer":
-                tool_result = await _notify_volunteer_tool(
-                    tool_args.get("telegram_id", ""),
-                    tool_args.get("message", ""),
-                    context,
-                )
+                if approve_ran_this_turn:
+                    logger.info("Skipping notify_volunteer — auto-notify already handled this turn")
+                    tool_result = json.dumps({"ok": True, "note": "already auto-notified"})
+                else:
+                    tool_result = await _notify_volunteer_tool(
+                        tool_args.get("telegram_id", ""),
+                        tool_args.get("message", ""),
+                        context,
+                    )
             else:
                 tool_result = _run_tool(tc.function.name, tool_args)
                 # Auto-notify volunteers when approve_draft succeeds
                 if tc.function.name == "approve_draft":
                     try:
                         result_data = json.loads(tool_result)
+                        if result_data.get("ok"):
+                            approve_ran_this_turn = True
                         if result_data.get("ok") and result_data.get("volunteers_to_notify"):
                             notified = 0
                             for vol in result_data["volunteers_to_notify"]:
