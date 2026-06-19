@@ -296,6 +296,71 @@ _ADMIN_ONLY_TOOLS = {
     "report_no_show",
 }
 
+SHIFT_NAMES = {
+    "breakfast":            {"en": "Breakfast (6:00–10:00)",           "es": "Desayuno (6:00–10:00)",            "pt": "Café da manhã (6:00–10:00)",       "fr": "Petit-déjeuner (6:00–10:00)"},
+    "breakfast_support":    {"en": "Breakfast Support (8:00–12:00)",   "es": "Apoyo desayuno (8:00–12:00)",      "pt": "Apoio café (8:00–12:00)",          "fr": "Support petit-déj (8:00–12:00)"},
+    "reception_morning":    {"en": "Reception AM (6:00–12:00)",        "es": "Recepción mañana (6:00–12:00)",    "pt": "Recepção manhã (6:00–12:00)",      "fr": "Réception matin (6:00–12:00)"},
+    "reception_day":        {"en": "Reception PM (12:00–18:00)",       "es": "Recepción tarde (12:00–18:00)",    "pt": "Recepção tarde (12:00–18:00)",     "fr": "Réception après-midi (12:00–18:00)"},
+    "reception_evening":    {"en": "Reception Eve (18:00–00:00)",      "es": "Recepción noche (18:00–00:00)",    "pt": "Recepção noite (18:00–00:00)",     "fr": "Réception soir (18:00–00:00)"},
+    "reception_overnight":  {"en": "Overnight (00:00–6:00)",           "es": "Turno nocturno (00:00–6:00)",      "pt": "Turno noturno (00:00–6:00)",       "fr": "Nuit (00:00–6:00)"},
+}
+
+DAY_NAMES = {
+    "en": ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"],
+    "es": ["Lunes","Martes","Miércoles","Jueves","Viernes","Sábado","Domingo"],
+    "pt": ["Segunda","Terça","Quarta","Quinta","Sexta","Sábado","Domingo"],
+    "fr": ["Lundi","Mardi","Mercredi","Jeudi","Vendredi","Samedi","Dimanche"],
+}
+
+MONTH_NAMES = {
+    "en": ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"],
+    "es": ["ene","feb","mar","abr","may","jun","jul","ago","sep","oct","nov","dic"],
+    "pt": ["jan","fev","mar","abr","mai","jun","jul","ago","set","out","nov","dez"],
+    "fr": ["jan","fév","mar","avr","mai","jun","juil","aoû","sep","oct","nov","déc"],
+}
+
+GREETINGS = {
+    "en": "Hi {name}! 🌊 Here are your shifts for the week",
+    "es": "¡Hola {name}! 🌊 Aquí están tus turnos para la semana",
+    "pt": "Oi {name}! 🌊 Aqui estão seus turnos da semana",
+    "fr": "Salut {name}! 🌊 Voici tes shifts pour la semaine",
+}
+
+CLOSINGS = {
+    "en": "See you at the hostel! 🏄 Any questions, write here.",
+    "es": "¡Nos vemos en el hostal! 🏄 Cualquier duda, escríbeme aquí.",
+    "pt": "Até no hostel! 🏄 Qualquer dúvida, escreve aqui.",
+    "fr": "À bientôt à l'auberge! 🏄 Des questions, écris ici.",
+}
+
+def _build_shift_message(name: str, week: str, shifts: list, lang: str) -> str:
+    """Build a warm, multilingual shift notification message."""
+    lang = lang if lang in DAY_NAMES else "en"
+    days  = DAY_NAMES[lang]
+    months = MONTH_NAMES[lang]
+    greeting = GREETINGS[lang].format(name=name)
+    lines = [greeting]
+    # Week label
+    try:
+        from datetime import date as _date, timedelta as _timedelta
+        monday = _date.fromisoformat(week)
+        sunday = monday + _timedelta(days=6)
+        wlabel = f"{monday.day}–{sunday.day} {months[monday.month-1]}"
+        lines.append(f"📅 {wlabel}:\n")
+    except Exception:
+        lines.append("")
+    for s in shifts:
+        try:
+            d = _date.fromisoformat(s["date"])
+            day_name = days[d.weekday()]
+            shift_label = SHIFT_NAMES.get(s["type"], {}).get(lang, s["type"])
+            lines.append(f"• {day_name} {d.day} — {shift_label}")
+        except Exception:
+            lines.append(f"• {s.get('date','?')} — {s.get('type','?')}")
+    lines.append("")
+    lines.append(CLOSINGS[lang])
+    return "\n".join(lines)
+
 async def _notify_admins_tool(message: str, context, acting_user_id: int = 0) -> str:
     """Send a notification to all admins except the one currently acting. Used as a tool by Grok."""
     admin_ids = _load_admin_ids()
@@ -469,6 +534,26 @@ async def _call_grok(user_id: int, user_type: str, internal_id: int | str, conte
                 )
             else:
                 tool_result = _run_tool(tc.function.name, tool_args)
+                # Auto-notify volunteers when approve_draft succeeds
+                if tc.function.name == "approve_draft":
+                    try:
+                        result_data = json.loads(tool_result)
+                        if result_data.get("ok") and result_data.get("volunteers_to_notify"):
+                            notified = 0
+                            for vol in result_data["volunteers_to_notify"]:
+                                tg_id = vol.get("telegram_id")
+                                name  = vol.get("name", "").split()[0]
+                                lang  = vol.get("language", "en")
+                                week  = result_data.get("week", "")
+                                shifts = vol.get("shifts", [])
+                                if not tg_id or not shifts:
+                                    continue
+                                msg = _build_shift_message(name, week, shifts, lang)
+                                await _notify_volunteer_tool(tg_id, msg, context)
+                                notified += 1
+                            logger.info(f"Auto-notified {notified} volunteers after approve_draft")
+                    except Exception as e:
+                        logger.error(f"Auto-notify after approve_draft failed: {e}")
             logger.info(f"Tool {tc.function.name} result: {tool_result[:200]}")
             messages.append({
                 "role": "tool",
