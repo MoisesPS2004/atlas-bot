@@ -184,6 +184,27 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "notify_volunteer",
+            "description": "Send a private Telegram message to ONE specific volunteer by their Telegram ID. Use this to send each volunteer their shifts after a schedule is approved, or to reply to a volunteer about their own schedule. Always write the message in the volunteer's own language.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "telegram_id": {
+                        "type": "string",
+                        "description": "The volunteer's Telegram ID (the numeric telegram_id from volunteers_to_notify, NOT their internal volunteer id)"
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "The message to send, already written in the volunteer's language"
+                    }
+                },
+                "required": ["telegram_id", "message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_volunteers",
             "description": "List all registered volunteers with their names, arrival/departure dates, and internal IDs. Use when an admin asks who is at the hostel or registered.",
             "parameters": {
@@ -291,6 +312,18 @@ async def _notify_admins_tool(message: str, context, acting_user_id: int = 0) ->
         except Exception as e:
             logger.error(f"Could not notify admin {admin_id}: {e}")
     return json.dumps({"ok": True, "notified": sent})
+
+async def _notify_volunteer_tool(telegram_id: str, message: str, context) -> str:
+    """Send a private message to one volunteer by Telegram ID. Telegram tool, not CLI."""
+    try:
+        await context.bot.send_message(
+            chat_id=int(telegram_id),
+            text=message,
+        )
+        return json.dumps({"ok": True, "sent_to": telegram_id})
+    except Exception as e:
+        logger.error(f"Could not notify volunteer {telegram_id}: {e}")
+        return json.dumps({"ok": False, "error": str(e)})
 
 # ─── Engine tool runner ───────────────────────────────────────────────────────
 def _run_tool(name: str, args: dict) -> str:
@@ -414,9 +447,25 @@ async def _call_grok(user_id: int, user_type: str, internal_id: int | str, conte
                     "content": json.dumps({"ok": False, "error": "permission denied: this action is for admins only"}),
                 })
                 continue
+
+            # notify_volunteer may only be triggered by an admin context (Atlas-only after approval)
+            if tc.function.name == "notify_volunteer" and user_type == "volunteer":
+                logger.warning(f"Volunteer {user_id} attempted notify_volunteer — blocked")
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": json.dumps({"ok": False, "error": "permission denied"}),
+                })
+                continue
             if tc.function.name == "notify_admins":
                 tool_result = await _notify_admins_tool(
                     tool_args.get("message", ""), context, acting_user_id=user_id
+                )
+            elif tc.function.name == "notify_volunteer":
+                tool_result = await _notify_volunteer_tool(
+                    tool_args.get("telegram_id", ""),
+                    tool_args.get("message", ""),
+                    context,
                 )
             else:
                 tool_result = _run_tool(tc.function.name, tool_args)
