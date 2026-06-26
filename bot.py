@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 from openai import OpenAI
+from training_callbacks import handle_training_callback
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
@@ -606,6 +607,69 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "How can I help?"
     )
 
+# ─── Callback handler — training confirmation ────────────────────────────────
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data or ""
+    if not data.startswith("training_confirm:"):
+        return
+
+    user_id = update.effective_user.id
+    access  = _check_access(user_id)
+    if access is None:
+        await query.edit_message_text("You're not registered. Please contact the Aquarela team.")
+        return
+
+    lang = "en"
+    try:
+        conn = sqlite3.connect(_DB_PATH)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT language FROM volunteers WHERE telegram_id = ?", (str(user_id),)
+        ).fetchone()
+        conn.close()
+        if row and row["language"]:
+            lang = row["language"]
+    except Exception as e:
+        logger.error(f"Could not load language for {user_id}: {e}")
+
+    result = handle_training_callback(
+        callback_data=data,
+        acting_telegram_id=str(user_id),
+        run_tool_fn=_run_tool,
+        load_admin_ids_fn=_load_admin_ids,
+        lang=lang,
+    )
+
+    action = result["action"]
+
+    if action == "confirm_prompt":
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("\u2705 S\u00ed / Yes", callback_data=result["confirm_yes_data"]),
+            InlineKeyboardButton("\u274c No",             callback_data=result["confirm_no_data"]),
+        ]])
+        await query.edit_message_text(result["reply_text"], reply_markup=kb)
+
+    elif action in ("completed", "pending", "error"):
+        await query.edit_message_text(result["reply_text"])
+        if result.get("notify_admins") and result.get("admin_message"):
+            admin_ids = _load_admin_ids()
+            for admin_id in admin_ids:
+                try:
+                    await context.bot.send_message(
+                        chat_id=admin_id,
+                        text=result["admin_message"],
+                    )
+                except Exception as e:
+                    logger.error(f"Could not notify admin {admin_id}: {e}")
+
+    else:
+        await query.edit_message_text(result["reply_text"])
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main() -> None:
     app = Application.builder().token(TOKEN).build()
@@ -613,6 +677,8 @@ def main() -> None:
     app.add_handler(CommandHandler("help",   handle_command))
     app.add_handler(CommandHandler("status", handle_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    from telegram.ext import CallbackQueryHandler as CQH
+    app.add_handler(CQH(handle_callback_query, pattern="^training_confirm:"))
     logger.info("Atlas bot started.")
     app.run_polling()
 
