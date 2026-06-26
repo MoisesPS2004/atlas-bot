@@ -284,6 +284,32 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "schedule_admin_training",
+            "description": "Register that an admin will be available to give a training session on a specific date. Use when an admin declares availability to train volunteers. Default module is day_rec (reception day training).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date": {
+                        "type": "string",
+                        "description": "Date of the training session in YYYY-MM-DD format"
+                    },
+                    "admin_telegram_id": {
+                        "type": "string",
+                        "description": "Telegram ID of the admin who will give the training"
+                    },
+                    "module": {
+                        "type": "string",
+                        "enum": ["breakfast", "day_rec", "night_rec"],
+                        "description": "Training module to schedule (default: day_rec)"
+                    }
+                },
+                "required": ["date", "admin_telegram_id"],
+            },
+        },
+    },
 ]
 
 _ADMIN_ONLY_TOOLS = {
@@ -295,6 +321,7 @@ _ADMIN_ONLY_TOOLS = {
     "list_volunteers",
     "confirm_training",
     "report_no_show",
+    "schedule_admin_training",
 }
 
 SHIFT_NAMES = {
@@ -419,6 +446,12 @@ def _run_tool(name: str, args: dict) -> str:
                                     "--stay-id",   str(args.get("stay_id", "")),
                                     *(["--arrival",   args.get("arrival")]   if args.get("arrival")   else []),
                                     *(["--departure", args.get("departure")] if args.get("departure") else [])],
+        "schedule_admin_training": [
+            "schedule-admin-training",
+            "--admin-telegram-id", args.get("admin_telegram_id", ""),
+            "--date",              args.get("date", ""),
+            *(["--module", args.get("module")] if args.get("module") else []),
+        ],
     }
     if name not in cmd_map:
         return json.dumps({"ok": False, "error": f"unknown tool: {name}"})
