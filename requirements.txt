@@ -1,0 +1,5 @@
+# Runtime dependencies — lo que el service (atlas-bot.service) necesita para correr bot.py.
+# Pin exacto para que "verde en producción" sea reproducible por construcción, no por azar del venv.
+# Versiones congeladas desde el venv operativo (2026-06-30).
+openai==2.43.0
+python-telegram-bot==22.8

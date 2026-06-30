@@ -1,0 +1,7 @@
+# Dev/test dependencies. Incluye el runtime + las herramientas de test.
+# El service de producción instala SOLO requirements.txt; nunca arrastra pytest.
+# pytest-asyncio es el plugin que hace reconocible 'asyncio_mode = auto' (pytest.ini)
+# y mantiene en verde los 3 tests async anti-spoofing de tests/test_access_control.py.
+-r requirements.txt
+pytest==9.1.1
+pytest-asyncio==1.4.0
