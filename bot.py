@@ -467,7 +467,14 @@ def _run_tool(name: str, args: dict) -> str:
 
 # ─── Access control ───────────────────────────────────────────────────────────
 def _check_access(telegram_id: int) -> tuple[str, int | str] | None:
-    """Returns ("volunteer", volunteer_id) or ("admin", role) or None."""
+    """Returns ("volunteer", volunteer_id) or ("admin", role) or None.
+
+    Assumes `telegram_id` is a valid positive integer supplied by the Telegram
+    API (via `update.effective_user.id`). This is an internal collaborator, not
+    a trust boundary: callers are the only providers and Telegram guarantees the
+    invariant. Invalid values (0, negatives) are not guarded — they resolve
+    safely to None by SQL no-match (fail-closed, safe-by-construction).
+    """
     try:
         conn = sqlite3.connect(_DB_PATH)
         conn.row_factory = sqlite3.Row
