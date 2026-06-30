@@ -10,23 +10,37 @@ Estados del callback_data:
   training_confirm:{vid}:{module}:no       → primera pantalla No → pedir confirmación
   training_confirm:{vid}:{module}:yes_sure → confirmó Sí → CLI + avisar voluntario
   training_confirm:{vid}:{module}:no_sure  → confirmó No → CLI + avisar voluntario + admins
+  training_confirm:{vid}:{module}:back     → "no, en realidad no" → re-muestra P1 sin DB write
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).parent.parent / "aquarela"))
+from training_texts import _MODULE_LABEL, _QUESTION, _BTN_YES, _BTN_NO
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Textos multilingüe
+# Textos multilingüe (propios de training_callbacks)
 # ---------------------------------------------------------------------------
 
-_MODULE_LABEL: dict[str, str] = {
-    "breakfast": "breakfast",
-    "day_rec":   "reception day",
-    "night_rec": "overnight",
+_CONFIRM_LABEL: dict[str, str] = {
+    "en": "✅ Yes, I confirm",
+    "es": "✅ Sí, confirmo",
+    "pt": "✅ Sim, confirmo",
+    "fr": "✅ Oui, je confirme",
+}
+
+_BACK_LABEL: dict[str, str] = {
+    "en": "↩ No, go back",
+    "es": "↩ No, en realidad no",
+    "pt": "↩ Não, voltar",
+    "fr": "↩ Non, revenir",
 }
 
 _SURE_TEXT: dict[str, str] = {
@@ -59,7 +73,8 @@ _ERROR_TEXT: dict[str, str] = {
 
 
 def _admin_message(vid: int, module: str) -> str:
-    label = _MODULE_LABEL.get(module, module)
+    module_dict = _MODULE_LABEL.get(module, {})
+    label = module_dict.get("en", module)
     return (
         f"⚠️ Volunteer (id={vid}) did not complete their {label} training. "
         f"Please assign them a new session as soon as possible."
@@ -91,12 +106,14 @@ def handle_training_callback(
     Retorna
     -------
     dict con las claves:
-      action           : 'confirm_prompt' | 'completed' | 'pending' | 'error'
-      reply_text       : texto a enviar al voluntario
-      confirm_yes_data : (solo en confirm_prompt) callback_data del botón Confirmar-Sí
-      confirm_no_data  : (solo en confirm_prompt) callback_data del botón Confirmar-No
-      notify_admins    : bool — True si hay que notificar a admins
-      admin_message    : str  — mensaje para los admins (vacío si notify_admins=False)
+      action            : 'confirm_prompt' | 'completed' | 'pending' | 'error'
+      reply_text        : texto a enviar al voluntario
+      confirm_yes_data  : (solo en confirm_prompt) callback_data del botón primario
+      confirm_yes_label : (solo en confirm_prompt) etiqueta del botón primario
+      confirm_no_data   : (solo en confirm_prompt) callback_data del botón secundario
+      confirm_no_label  : (solo en confirm_prompt) etiqueta del botón secundario
+      notify_admins     : bool — True si hay que notificar a admins
+      admin_message     : str  — mensaje para los admins (vacío si notify_admins=False)
     """
     lang = lang if lang in _YES_COMPLETED else "en"
 
@@ -118,13 +135,32 @@ def handle_training_callback(
 
     # --- Primera pantalla: pedir confirmación ---
     if state in ("yes", "no"):
+        sure_state = "yes_sure" if state == "yes" else "no_sure"
         return {
-            "action":          "confirm_prompt",
-            "reply_text":      _SURE_TEXT[lang],
-            "confirm_yes_data": f"training_confirm:{vid}:{module}:yes_sure",
-            "confirm_no_data":  f"training_confirm:{vid}:{module}:no_sure",
-            "notify_admins":   False,
-            "admin_message":   "",
+            "action":            "confirm_prompt",
+            "reply_text":        _SURE_TEXT[lang],
+            "confirm_yes_data":  f"training_confirm:{vid}:{module}:{sure_state}",
+            "confirm_yes_label": _CONFIRM_LABEL.get(lang, _CONFIRM_LABEL["en"]),
+            "confirm_no_data":   f"training_confirm:{vid}:{module}:back",
+            "confirm_no_label":  _BACK_LABEL.get(lang, _BACK_LABEL["en"]),
+            "notify_admins":     False,
+            "admin_message":     "",
+        }
+
+    # --- Volver a P1 sin escribir DB ---
+    if state == "back":
+        module_dict = _MODULE_LABEL.get(module, _MODULE_LABEL["night_rec"])
+        label  = module_dict.get(lang, module_dict["en"])
+        q_tmpl = _QUESTION.get(lang, _QUESTION["en"])
+        return {
+            "action":            "confirm_prompt",
+            "reply_text":        q_tmpl.format(module=label),
+            "confirm_yes_data":  f"training_confirm:{vid}:{module}:yes",
+            "confirm_yes_label": _BTN_YES.get(lang, _BTN_YES["en"]),
+            "confirm_no_data":   f"training_confirm:{vid}:{module}:no",
+            "confirm_no_label":  _BTN_NO.get(lang, _BTN_NO["en"]),
+            "notify_admins":     False,
+            "admin_message":     "",
         }
 
     # --- Segunda pantalla: confirmó Sí ---

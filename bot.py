@@ -681,8 +681,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     if action == "confirm_prompt":
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
         kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("\u2705 S\u00ed / Yes", callback_data=result["confirm_yes_data"]),
-            InlineKeyboardButton("\u274c No",             callback_data=result["confirm_no_data"]),
+            InlineKeyboardButton(result["confirm_yes_label"], callback_data=result["confirm_yes_data"]),
+            InlineKeyboardButton(result["confirm_no_label"],  callback_data=result["confirm_no_data"]),
         ]])
         await query.edit_message_text(result["reply_text"], reply_markup=kb)
 
