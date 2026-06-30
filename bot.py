@@ -538,6 +538,10 @@ async def _call_grok(user_id: int, user_type: str, internal_id: int | str, conte
         approve_ran_this_turn = False
         for tc in msg.tool_calls:
             tool_args = json.loads(tc.function.arguments)
+            # Pin self-service identity fields to the authenticated session —
+            # the LLM must never be the authority on who the caller is.
+            if user_type == "volunteer" and tc.function.name == "save_preferences":
+                tool_args["volunteer_id"] = internal_id
             # Enforce admin-only tools
             if user_type == "volunteer" and tc.function.name in _ADMIN_ONLY_TOOLS:
                 logger.warning(f"Volunteer {user_id} attempted admin tool {tc.function.name} — blocked")
