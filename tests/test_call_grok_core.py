@@ -21,13 +21,29 @@ These lock the SECURITY CONTRACT agreed during the B.1 alignment ("Grill Me"):
   9. pin_identity pins volunteer_id only for volunteer + save_preferences,
      without mutating the input dict.
 
+B.2 adds the parseo/ensamblado helpers used by the tool-dispatch loop:
+  10. parse_tool_call_args is a pure json.loads wrapper — no new error
+      handling, a malformed JSON string still raises.
+  11. build_assistant_tool_calls_message reproduces the exact shape the
+      OpenAI-compatible API expects for the echoed tool_calls.
+  12. build_tool_result_message / build_denial_result reproduce the exact
+      {"role": "tool", ...} / {"ok": false, "error": ...} shapes the driver
+      used to build inline.
+
 0 I/O, 0 mocks needed — these call the pure functions directly.
 """
+import json
+from types import SimpleNamespace
+
 import pytest
 
 from call_grok_core import (
     authorize,
     pin_identity,
+    parse_tool_call_args,
+    build_assistant_tool_calls_message,
+    build_tool_result_message,
+    build_denial_result,
     ADMIN_ONLY_TOOLS,
     NOTIFY_TOOLS,
     OPEN_TOOLS,
@@ -120,3 +136,61 @@ def test_pin_identity_is_a_passthrough_for_other_tools():
     original = {"week": "2026-07-06"}
     result = pin_identity("volunteer", "show_schedule", original, internal_id=42)
     assert result == original
+
+
+# ─── Invariant 10-12: B.2 parseo + ensamblado de mensajes ──────────────────────
+
+def test_parse_tool_call_args_is_a_pure_json_loads_wrapper():
+    """SDC #10: parses valid JSON exactly like json.loads."""
+    assert parse_tool_call_args('{"week": "2026-07-06"}') == {"week": "2026-07-06"}
+
+
+def test_parse_tool_call_args_still_raises_on_malformed_json():
+    """SDC #10: no new error handling — a malformed string still raises,
+    same as the driver's bare json.loads() call before B.2."""
+    with pytest.raises(Exception):
+        parse_tool_call_args("{not valid json")
+
+
+def test_build_assistant_tool_calls_message_matches_openai_shape():
+    """SDC #11: reproduces the exact shape the API expects for the echo."""
+    fc = SimpleNamespace(name="show_schedule", arguments='{"week": "2026-07-06"}')
+    tc = SimpleNamespace(id="call_1", function=fc)
+
+    result = build_assistant_tool_calls_message("thinking...", [tc])
+
+    assert result == {
+        "role": "assistant",
+        "content": "thinking...",
+        "tool_calls": [{
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "show_schedule", "arguments": '{"week": "2026-07-06"}'},
+        }],
+    }
+
+
+def test_build_assistant_tool_calls_message_defaults_none_content_to_empty_string():
+    """SDC #11: msg.content is None when the model only returns tool_calls —
+    the driver relied on `msg.content or ""` before B.2."""
+    fc = SimpleNamespace(name="show_schedule", arguments="{}")
+    tc = SimpleNamespace(id="call_1", function=fc)
+
+    result = build_assistant_tool_calls_message(None, [tc])
+    assert result["content"] == ""
+
+
+def test_build_tool_result_message_matches_shape():
+    """SDC #12: reproduces the {"role": "tool", ...} shape used by the driver."""
+    assert build_tool_result_message("call_1", '{"ok": true}') == {
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": '{"ok": true}',
+    }
+
+
+def test_build_denial_result_matches_shape():
+    """SDC #12: reproduces the {"ok": false, "error": ...} shape used for authorize() denials."""
+    assert json.loads(build_denial_result("permission denied")) == {
+        "ok": False, "error": "permission denied",
+    }

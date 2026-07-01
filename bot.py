@@ -7,7 +7,14 @@ from pathlib import Path
 
 from openai import OpenAI
 from training_callbacks import handle_training_callback
-from call_grok_core import authorize, pin_identity
+from call_grok_core import (
+    authorize,
+    pin_identity,
+    parse_tool_call_args,
+    build_assistant_tool_calls_message,
+    build_tool_result_message,
+    build_denial_result,
+)
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
@@ -527,13 +534,10 @@ async def _call_grok(user_id: int, user_type: str, internal_id: int | str, conte
             return msg.content or "..."
 
         # Tool calls — run each one and feed results back
-        messages.append({"role": "assistant", "content": msg.content or "", "tool_calls": [
-            {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-            for tc in msg.tool_calls
-        ]})
+        messages.append(build_assistant_tool_calls_message(msg.content, msg.tool_calls))
         approve_ran_this_turn = False
         for tc in msg.tool_calls:
-            tool_args = json.loads(tc.function.arguments)
+            tool_args = parse_tool_call_args(tc.function.arguments)
             # Pin self-service identity fields to the authenticated session —
             # the LLM must never be the authority on who the caller is.
             tool_args = pin_identity(user_type, tc.function.name, tool_args, internal_id)
@@ -541,11 +545,7 @@ async def _call_grok(user_id: int, user_type: str, internal_id: int | str, conte
             allowed, deny_reason = authorize(user_type, tc.function.name)
             if not allowed:
                 logger.warning(f"{user_type} {user_id} denied for tool {tc.function.name}: {deny_reason}")
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": json.dumps({"ok": False, "error": deny_reason}),
-                })
+                messages.append(build_tool_result_message(tc.id, build_denial_result(deny_reason)))
                 continue
 
             if tc.function.name == "notify_admins":
@@ -587,11 +587,7 @@ async def _call_grok(user_id: int, user_type: str, internal_id: int | str, conte
                     except Exception as e:
                         logger.error(f"Auto-notify after approve_draft failed: {e}")
             logger.info(f"Tool {tc.function.name} result: {tool_result[:200]}")
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": tool_result,
-            })
+            messages.append(build_tool_result_message(tc.id, tool_result))
 
     # Reached max iterations
     logger.warning(f"Max tool iterations reached for user {user_id}")

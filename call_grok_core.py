@@ -7,8 +7,9 @@ driver imperativo en bot.py llama a estas funciones puras y actúa según lo
 que devuelven.
 
 Hueco B (strangler-fig, por fases):
-  B.1 (este archivo, por ahora) → authorize() + pin_identity()
-  B.2 → parseo de tool calls + ensamblado de mensajes assistant/tool
+  B.1 → authorize() + pin_identity()
+  B.2 (este archivo, por ahora) → parseo de tool calls + ensamblado de
+       mensajes assistant/tool
   B.3 → plan_post_approve_notifications()
   B.4 → frontera de efectos (deps.perform)
 
@@ -29,6 +30,8 @@ authorize() — invariantes de seguridad (Hueco B / B.1 Grill Me):
   4. Todo lo demás (OPEN_TOOLS) queda abierto a cualquier user_type conocido.
 """
 from __future__ import annotations
+
+import json
 
 ADMIN_ONLY_TOOLS = frozenset({
     "generate_draft",
@@ -87,3 +90,45 @@ def pin_identity(user_type: str, tool_name: str, tool_args: dict, internal_id) -
     if user_type == "volunteer" and tool_name == "save_preferences":
         return {**tool_args, "volunteer_id": internal_id}
     return tool_args
+
+
+# ─── B.2: parseo de tool calls + ensamblado de mensajes ────────────────────────
+
+def parse_tool_call_args(arguments_json: str) -> dict:
+    """
+    Parsea el string JSON de argumentos de un tool call. Envoltorio puro de
+    json.loads — sin manejo de error nuevo: un JSON malformado sigue
+    propagando la excepción tal como lo hacía el driver antes de B.2.
+    """
+    return json.loads(arguments_json)
+
+
+def build_assistant_tool_calls_message(content: str, tool_calls) -> dict:
+    """
+    Construye el mensaje 'assistant' que hace eco de los tool_calls del
+    modelo hacia atrás en la conversación, con la forma exacta que espera
+    la API compatible con OpenAI. tool_calls es la lista cruda del SDK
+    (cada item expone .id y .function.name/.arguments).
+    """
+    return {
+        "role": "assistant",
+        "content": content or "",
+        "tool_calls": [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+            }
+            for tc in tool_calls
+        ],
+    }
+
+
+def build_tool_result_message(tool_call_id: str, content: str) -> dict:
+    """Construye un mensaje 'tool' que lleva el resultado (o denegación) de un tool call."""
+    return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
+
+
+def build_denial_result(error: str) -> str:
+    """Codifica en JSON una denegación de authorize() en la forma {"ok": false, "error": ...} que el modelo espera como tool_result."""
+    return json.dumps({"ok": False, "error": error})
