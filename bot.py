@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 from openai import OpenAI
+from log_policy import apply_secret_safe_logging
 from training_callbacks import handle_training_callback
 from call_grok_core import (
     authorize,
@@ -24,6 +25,10 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 
 # ─── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
+# Hueco E — higiene de secretos: silenciar los loggers de httpx/httpcore, que
+# a INFO emiten la URL de getUpdates con el token del bot en texto plano.
+# Debe ir DESPUÉS de basicConfig para que el setLevel por-logger gane al root.
+apply_secret_safe_logging()
 logger = logging.getLogger(__name__)
 
 # ─── Paths and constants ─────────────────────────────────────────────────────
