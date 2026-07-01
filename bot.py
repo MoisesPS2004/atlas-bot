@@ -15,6 +15,8 @@ from call_grok_core import (
     build_tool_result_message,
     build_denial_result,
     plan_post_approve_notifications,
+    sanitize_tool_args,
+    ValidationError,
     Deps,
 )
 from telegram import Update
@@ -419,6 +421,15 @@ async def _notify_volunteer_tool(telegram_id: str, message: str, context) -> str
 # ─── Engine tool runner ───────────────────────────────────────────────────────
 def _run_tool(name: str, args: dict) -> str:
     """Call the engine CLI with the given tool name and args. Returns JSON string."""
+    # Hueco D — frontera del proceso: cada valor del LLM se sanea por la
+    # semántica del nombre de su argumento ANTES de construir argv. Fail-closed:
+    # un valor mal formado o con forma de flag ("--data", "-rf") se rechaza acá
+    # y nunca llega a subprocess.run. Ver call_grok_core.sanitize_tool_args.
+    try:
+        args = sanitize_tool_args(args)
+    except ValidationError as e:
+        logger.warning(f"Tool {name} rejected invalid argument: {e}")
+        return json.dumps({"ok": False, "error": f"invalid argument: {e}"})
     cmd_map = {
         "generate_draft":    ["generate-draft",   "--week",      args.get("week", "")],
         "show_schedule":     ["show-schedule",    "--week",      args.get("week", "")],

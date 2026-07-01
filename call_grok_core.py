@@ -35,6 +35,8 @@ authorize() — invariantes de seguridad (Hueco B / B.1 Grill Me):
 from __future__ import annotations
 
 import json
+import re
+from datetime import date
 from typing import Callable, NamedTuple
 
 ADMIN_ONLY_TOOLS = frozenset({
@@ -211,3 +213,160 @@ class Deps(NamedTuple):
     """
     call_model: Callable
     perform: Callable
+
+
+# ─── Hueco D: validación de argumentos en la frontera del proceso ───────────────
+#
+# _run_tool (bot.py) arma argv para subprocess.run -> aquarela_cli.py con args
+# producidos por el LLM (no confiables). Como usa lista (no shell=True), no hay
+# shell-injection; el riesgo real es FLAG injection: un valor como "--data" o
+# "-rf" donde argparse del CLI espera un dato posicional/de valor puede ser
+# leído como opción. Además deja cruzar datos con forma inválida (una "week"
+# inventada, un volunteer_id no numérico) sin chequear.
+#
+# Mitigación en la frontera del proceso, NO dentro del engine (aquarela_cli.py
+# sigue siendo el contrato mínimo de Hueco A: solo se cruza por subprocess).
+# Allowlist por CAMPO (Grill Me Sesión 7): la semántica de cada valor depende
+# del NOMBRE del argumento, que es consistente en las 12 tools que cruzan a la
+# CLI. Un validador puro por semántica; el registro FIELD_VALIDATORS mapea cada
+# nombre de argumento a su validador. Funciones puras (input -> str saneado |
+# ValidationError), testeables sin subprocess real. No es un parser genérico:
+# solo valida los campos que _run_tool ya conoce.
+
+
+class ValidationError(ValueError):
+    """Un argumento del LLM no pasó la validación de frontera de _run_tool."""
+
+
+_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+_MODULES = frozenset({"breakfast", "day_rec", "night_rec"})
+_MAX_NAME = 100
+
+
+def _reject_leading_dash(field: str, value: str) -> None:
+    """Guarda anti-flag fail-closed: un '-' inicial haría que argparse lea el
+    valor como opción. Los guiones interiores ("Jean-Paul") sí se permiten."""
+    if value.startswith("-"):
+        raise ValidationError(f"{field}: value may not start with '-' (flag injection)")
+
+
+def _v_date(field: str, value) -> str:
+    """ISO YYYY-MM-DD, zero-padded y fecha de calendario real."""
+    if not isinstance(value, str) or not _DATE_RE.fullmatch(value):
+        raise ValidationError(f"{field}: expected date YYYY-MM-DD, got {value!r}")
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        raise ValidationError(f"{field}: not a real calendar date: {value!r}")
+    return value
+
+
+def _v_pos_int(field: str, value) -> str:
+    """Entero positivo. Acepta int o string de solo dígitos; str.isdigit()
+    rechaza signos, decimales, espacios y vacío. bool no es un id válido."""
+    if isinstance(value, bool):
+        raise ValidationError(f"{field}: expected a positive integer, got bool")
+    if isinstance(value, int):
+        n = value
+    elif isinstance(value, str) and value.isdigit():
+        n = int(value)
+    else:
+        raise ValidationError(f"{field}: expected a positive integer, got {value!r}")
+    if n <= 0:
+        raise ValidationError(f"{field}: must be positive, got {n}")
+    return str(n)
+
+
+def _v_telegram_id(field: str, value) -> str:
+    """ID de Telegram: string numérico positivo (o int). Sin signos ni espacios."""
+    if isinstance(value, bool):
+        raise ValidationError(f"{field}: expected a numeric telegram id, got bool")
+    if isinstance(value, int):
+        if value <= 0:
+            raise ValidationError(f"{field}: must be positive, got {value}")
+        return str(value)
+    if isinstance(value, str) and value.isdigit():
+        return value
+    raise ValidationError(f"{field}: expected a numeric telegram id, got {value!r}")
+
+
+def _v_module(field: str, value) -> str:
+    if value not in _MODULES:
+        raise ValidationError(f"{field}: expected one of {sorted(_MODULES)}, got {value!r}")
+    return value
+
+
+def _v_active_only(field: str, value) -> str:
+    if value not in ("true", "false"):
+        raise ValidationError(f"{field}: expected 'true' or 'false', got {value!r}")
+    return value
+
+
+def _v_json(field: str, value) -> str:
+    """JSON válido. Guarda estricta de guion inicial (un '-' delante haría que
+    argparse lo lea como flag) aunque sea JSON válido; los guiones interiores
+    dentro del string JSON no se tocan."""
+    if not isinstance(value, str):
+        raise ValidationError(f"{field}: expected a JSON string, got {value!r}")
+    _reject_leading_dash(field, value)
+    try:
+        json.loads(value)
+    except (json.JSONDecodeError, ValueError):
+        raise ValidationError(f"{field}: not valid JSON")
+    return value
+
+
+def _v_name(field: str, value) -> str:
+    """Texto libre acotado. Guarda estricta de guion inicial; los guiones
+    interiores ("Jean-Paul") se permiten."""
+    if not isinstance(value, str) or not value:
+        raise ValidationError(f"{field}: expected a non-empty name, got {value!r}")
+    _reject_leading_dash(field, value)
+    if len(value) > _MAX_NAME:
+        raise ValidationError(f"{field}: name too long ({len(value)} > {_MAX_NAME})")
+    return value
+
+
+# Registro por nombre de argumento. La semántica de cada nombre es consistente
+# en las 12 tools de _run_tool, así que un único validador por nombre alcanza.
+FIELD_VALIDATORS = {
+    "week":              _v_date,
+    "date":              _v_date,
+    "arrival":           _v_date,
+    "departure":         _v_date,
+    "volunteer_id":      _v_pos_int,
+    "shift_id":          _v_pos_int,
+    "stay_id":           _v_pos_int,
+    "telegram_id":       _v_telegram_id,
+    "admin_telegram_id": _v_telegram_id,
+    "module":            _v_module,
+    "active_only":       _v_active_only,
+    "data":              _v_json,
+    "name":              _v_name,
+}
+
+
+def sanitize_arg(field_name: str, value):
+    """Sanea un único argumento por la semántica de su nombre. Devuelve el
+    valor saneado (string, listo para argv) o levanta ValidationError."""
+    validator = FIELD_VALIDATORS.get(field_name)
+    if validator is None:
+        raise ValidationError(f"no validator registered for field {field_name!r}")
+    return validator(field_name, value)
+
+
+def sanitize_tool_args(args: dict) -> dict:
+    """Sanea, campo por campo, los argumentos que cruzarán a argv del CLI.
+
+    Fail-closed: cualquier campo con validador registrado que no pase su forma
+    esperada levanta ValidationError ANTES de que _run_tool arme el subprocess.
+    Los campos SIN validador registrado (p.ej. 'confirmed', que cmd_map
+    coerciona a la literal "true"/"false" y nunca pasa crudo a argv) se dejan
+    intactos. No muta el dict recibido.
+    """
+    out = dict(args)
+    for field, value in args.items():
+        validator = FIELD_VALIDATORS.get(field)
+        if validator is not None:
+            out[field] = validator(field, value)
+    return out
