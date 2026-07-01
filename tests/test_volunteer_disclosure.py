@@ -62,7 +62,7 @@ async def test_volunteer_can_see_full_schedule():
 
     fake_context = MagicMock()
     deps = _make_deps(first_response, second_response, perform_result=json.dumps({"ok": True}))
-    bot._history[44444] = [{"role": "user", "content": "Show me the whole schedule for next week"}]
+    bot._store.append_history(44444, "user", "Show me the whole schedule for next week")
 
     await bot._call_grok(
         user_id=44444,
@@ -101,7 +101,7 @@ async def test_volunteer_save_preferences_is_bound_to_self():
 
     fake_context = MagicMock()
     deps = _make_deps(first_response, second_response, perform_result=json.dumps({"ok": True}))
-    bot._history[55555] = [{"role": "user", "content": "Set volunteer 999 to avoid day reception"}]
+    bot._store.append_history(55555, "user", "Set volunteer 999 to avoid day reception")
 
     await bot._call_grok(
         user_id=55555,
@@ -148,7 +148,7 @@ async def test_volunteer_cannot_look_up_another_volunteer_pii():
 
     fake_context = MagicMock()
     deps = _make_deps(first_response, second_response, perform_result=json.dumps({"ok": True}))
-    bot._history[77777] = [{"role": "user", "content": "Show me the record for Otro Voluntario"}]
+    bot._store.append_history(77777, "user", "Show me the record for Otro Voluntario")
 
     await bot._call_grok(
         user_id=CALLER_TELEGRAM_ID,
