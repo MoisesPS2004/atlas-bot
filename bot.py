@@ -7,6 +7,7 @@ from pathlib import Path
 
 from openai import OpenAI
 from training_callbacks import handle_training_callback
+from call_grok_core import authorize, pin_identity
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
@@ -312,18 +313,6 @@ TOOLS = [
     },
 ]
 
-_ADMIN_ONLY_TOOLS = {
-    "generate_draft",
-    "delete_draft",
-    "approve_draft",
-    "deactivate_volunteer",
-    "update_volunteer_dates",
-    "list_volunteers",
-    "confirm_training",
-    "report_no_show",
-    "schedule_admin_training",
-}
-
 SHIFT_NAMES = {
     "breakfast":            {"en": "Breakfast (6:00–10:00)",           "es": "Desayuno (6:00–10:00)",            "pt": "Café da manhã (6:00–10:00)",       "fr": "Petit-déjeuner (6:00–10:00)"},
     "breakfast_support":    {"en": "Breakfast Support (8:00–12:00)",   "es": "Apoyo desayuno (8:00–12:00)",      "pt": "Apoio café (8:00–12:00)",          "fr": "Support petit-déj (8:00–12:00)"},
@@ -547,27 +536,18 @@ async def _call_grok(user_id: int, user_type: str, internal_id: int | str, conte
             tool_args = json.loads(tc.function.arguments)
             # Pin self-service identity fields to the authenticated session —
             # the LLM must never be the authority on who the caller is.
-            if user_type == "volunteer" and tc.function.name == "save_preferences":
-                tool_args["volunteer_id"] = internal_id
-            # Enforce admin-only tools
-            if user_type == "volunteer" and tc.function.name in _ADMIN_ONLY_TOOLS:
-                logger.warning(f"Volunteer {user_id} attempted admin tool {tc.function.name} — blocked")
+            tool_args = pin_identity(user_type, tc.function.name, tool_args, internal_id)
+
+            allowed, deny_reason = authorize(user_type, tc.function.name)
+            if not allowed:
+                logger.warning(f"{user_type} {user_id} denied for tool {tc.function.name}: {deny_reason}")
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
-                    "content": json.dumps({"ok": False, "error": "permission denied: this action is for admins only"}),
+                    "content": json.dumps({"ok": False, "error": deny_reason}),
                 })
                 continue
 
-            # notify_volunteer may only be triggered by an admin context (Atlas-only after approval)
-            if tc.function.name == "notify_volunteer" and user_type == "volunteer":
-                logger.warning(f"Volunteer {user_id} attempted notify_volunteer — blocked")
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": json.dumps({"ok": False, "error": "permission denied"}),
-                })
-                continue
             if tc.function.name == "notify_admins":
                 tool_result = await _notify_admins_tool(
                     tool_args.get("message", ""), context, acting_user_id=user_id
