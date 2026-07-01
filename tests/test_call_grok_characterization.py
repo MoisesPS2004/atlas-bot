@@ -1,27 +1,26 @@
 """
 Vertical Slice: characterization suite for _call_grok (bot.py:522-618) — Hueco B / B.0.
 
-These tests pin the behavior of _call_grok EXACTLY AS IT EXISTS TODAY, before any
-extraction. They are the strangler-fig safety net: B.1-B.4 must keep this suite
-GREEN except where a test is explicitly marked as documenting a gap that B.1 is
-going to close on purpose (see inline "⚠️ TODAY'S BEHAVIOR" notes). A change to
-one of those marked assertions in B.1 is an intentional behavior change, agreed
-in the B.1 Grill Me — not a regression.
+These tests pin the behavior of _call_grok. They are the strangler-fig
+safety net: every phase (B.0-B.4) must keep this suite GREEN except where a
+test is explicitly marked "FIXED IN B.n" — those document an intentional
+behavior change agreed in that phase's Grill Me, not a regression.
 
 This file intentionally does NOT duplicate the contract already locked by
 tests/test_access_control.py (pin_identity for save_preferences, admin-only
-block for _ADMIN_ONLY_TOOLS members). It covers the paths that file leaves
-uncharacterized: the default for tool_names outside any explicit allow/deny
-list, the two notify_* tools, the auto-notify-after-approve_draft branch and
-its swallowed exceptions, and the max-iteration fallback.
+block for the pre-existing admin-only tools). It covers the paths that file
+leaves uncharacterized: the default for tool_names outside any explicit
+allow/deny list, the two notify_* tools, the auto-notify-after-approve_draft
+branch, and the max-iteration fallback.
 
-Same harness as test_access_control.py: patch bot._client.chat.completions.create
-with a scripted side_effect (one fake response per agentic-loop turn) and patch
-whatever bot.* effect function the case cares about. No network, no subprocess.
+Since Hueco B / B.4, _call_grok no longer reaches for module globals
+(_client, _run_tool, _notify_admins_tool, _notify_volunteer_tool) — it
+depends only on an injected call_grok_core.Deps(call_model, perform). These
+tests construct fake deps directly (no bot.* patching, no network).
 """
 import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch, AsyncMock
+from unittest.mock import MagicMock, Mock, AsyncMock
 
 import pytest
 
@@ -44,19 +43,41 @@ def _llm_response(tool_calls=None, content=None):
     return SimpleNamespace(choices=[choice])
 
 
+def _make_call_model(*responses):
+    """Fake deps.call_model: yields each fake LLM response in order, one per agentic-loop turn."""
+    return Mock(side_effect=list(responses))
+
+
+def _make_perform(**responses):
+    """
+    Fake deps.perform: a single AsyncMock whose side_effect branches on
+    tool_name. `responses` maps tool_name -> the JSON string to return; any
+    tool_name not listed returns '{"ok": true}'. Every call is recorded on
+    the returned mock via the normal AsyncMock call_args_list/assert_* API.
+    """
+    def _side_effect(tool_name, tool_args, context, acting_user_id):
+        return responses.get(tool_name, json.dumps({"ok": True}))
+    return AsyncMock(side_effect=_side_effect)
+
+
+def _calls_for(mock_perform, tool_name):
+    """Filter a fake perform's call_args_list down to calls for one tool_name."""
+    return [c for c in mock_perform.call_args_list if c.args[0] == tool_name]
+
+
 # ─── Case 1: unknown tool_name — fail-closed since B.1 ────────────────────────
 
 @pytest.mark.asyncio
 async def test_unknown_tool_name_is_denied_fail_closed():
     """
-    FIXED IN B.1 — before this phase, the volunteer gate at bot.py:553 only
-    blocked names present in _ADMIN_ONLY_TOOLS, and the notify_volunteer
-    check only matched that one literal name; a tool_name in neither set
-    fell through to _run_tool and only failed there as an execution error,
-    not a permission error (see B.0's original version of this test).
+    FIXED IN B.1 — before this phase, the volunteer gate only blocked names
+    present in the admin-only set, and the notify_volunteer check only
+    matched that one literal name; a tool_name in neither set fell through
+    to the tool runner and only failed there as an execution error, not a
+    permission error (see B.0's original version of this test).
 
     Since B.1, call_grok_core.authorize() denies any tool_name outside
-    KNOWN_TOOL_NAMES up front, before _run_tool is ever reached — for any
+    KNOWN_TOOL_NAMES up front, before deps.perform is ever reached — for any
     user_type, including admin (see tests/test_call_grok_core.py invariant
     2 for the admin case).
     """
@@ -69,18 +90,18 @@ async def test_unknown_tool_name_is_denied_fail_closed():
     fake_context = MagicMock()
     bot._history[44444] = [{"role": "user", "content": "do the thing"}]
 
-    with patch.object(bot._client.chat.completions, "create",
-                      side_effect=[first_response, second_response]) as mock_llm, \
-         patch("bot._run_tool") as mock_run_tool:
+    mock_call_model = _make_call_model(first_response, second_response)
+    mock_perform = _make_perform()
 
-        result = await bot._call_grok(
-            user_id=44444, user_type="volunteer", internal_id=1, context=fake_context,
-        )
+    result = await bot._call_grok(
+        user_id=44444, user_type="volunteer", internal_id=1, context=fake_context,
+        deps=bot.Deps(call_model=mock_call_model, perform=mock_perform),
+    )
 
-    mock_run_tool.assert_not_called()
+    mock_perform.assert_not_called()
     assert result == "done"
 
-    second_call_messages = mock_llm.call_args_list[1].kwargs["messages"]
+    second_call_messages = mock_call_model.call_args_list[1].args[0]
     tool_msg = next(m for m in second_call_messages if m.get("tool_call_id") == "call_unknown")
     assert json.loads(tool_msg["content"]) == {
         "ok": False, "error": "permission denied: unknown tool",
@@ -92,8 +113,8 @@ async def test_unknown_tool_name_is_denied_fail_closed():
 @pytest.mark.asyncio
 async def test_notify_admins_is_blocked_for_a_volunteer_since_b1():
     """
-    FIXED IN B.1 — before this phase, bot.py:571-574 dispatched notify_admins
-    for ANY user_type; there was no admin-only guard on that branch, unlike
+    FIXED IN B.1 — before this phase, notify_admins was dispatched for ANY
+    user_type; there was no admin-only guard on that branch, unlike
     notify_volunteer. That was the live version of the prompt-injection risk
     flagged in the Q2 alignment (a volunteer could reach notify_admins via a
     Grok tool call with zero restriction — see B.0's original version of
@@ -112,18 +133,18 @@ async def test_notify_admins_is_blocked_for_a_volunteer_since_b1():
     fake_context = MagicMock()
     bot._history[55555] = [{"role": "user", "content": "tell the admins"}]
 
-    with patch.object(bot._client.chat.completions, "create",
-                      side_effect=[first_response, second_response]) as mock_llm, \
-         patch("bot._notify_admins_tool", new_callable=AsyncMock) as mock_notify_admins:
+    mock_call_model = _make_call_model(first_response, second_response)
+    mock_perform = _make_perform()
 
-        result = await bot._call_grok(
-            user_id=55555, user_type="volunteer", internal_id=7, context=fake_context,
-        )
+    result = await bot._call_grok(
+        user_id=55555, user_type="volunteer", internal_id=7, context=fake_context,
+        deps=bot.Deps(call_model=mock_call_model, perform=mock_perform),
+    )
 
-    mock_notify_admins.assert_not_called()
+    mock_perform.assert_not_called()
     assert result == "I can't do that."
 
-    second_call_messages = mock_llm.call_args_list[1].kwargs["messages"]
+    second_call_messages = mock_call_model.call_args_list[1].args[0]
     tool_msg = next(m for m in second_call_messages if m.get("tool_call_id") == "call_notify_admins")
     assert json.loads(tool_msg["content"]) == {"ok": False, "error": "permission denied"}
 
@@ -133,9 +154,9 @@ async def test_notify_admins_is_blocked_for_a_volunteer_since_b1():
 @pytest.mark.asyncio
 async def test_notify_volunteer_is_blocked_for_a_volunteer():
     """
-    Regression guard for the explicit block at bot.py:563-570. Unlike
-    notify_admins (case 2), this branch already denies volunteers today —
-    B.1 should preserve this outcome (now via authorize()), not change it.
+    Regression guard for the notify_volunteer block. Unlike notify_admins
+    (case 2), this branch already denied volunteers before B.1 — every phase
+    since should preserve this outcome (now via authorize()), not change it.
     """
     tool_call = _make_tool_call(
         tc_id="call_notify_vol", name="notify_volunteer",
@@ -147,19 +168,18 @@ async def test_notify_volunteer_is_blocked_for_a_volunteer():
     fake_context = MagicMock()
     bot._history[66666] = [{"role": "user", "content": "message this volunteer"}]
 
-    with patch.object(bot._client.chat.completions, "create",
-                      side_effect=[first_response, second_response]) as mock_llm, \
-         patch("bot._notify_volunteer_tool", new_callable=AsyncMock) as mock_notify_vol:
+    mock_call_model = _make_call_model(first_response, second_response)
+    mock_perform = _make_perform()
 
-        result = await bot._call_grok(
-            user_id=66666, user_type="volunteer", internal_id=9, context=fake_context,
-        )
+    result = await bot._call_grok(
+        user_id=66666, user_type="volunteer", internal_id=9, context=fake_context,
+        deps=bot.Deps(call_model=mock_call_model, perform=mock_perform),
+    )
 
-    mock_notify_vol.assert_not_called()
+    mock_perform.assert_not_called()
     assert result == "I can't do that."
 
-    # The denial reaches the model verbatim, as today's literal at bot.py:568.
-    second_call_messages = mock_llm.call_args_list[1].kwargs["messages"]
+    second_call_messages = mock_call_model.call_args_list[1].args[0]
     tool_msg = next(m for m in second_call_messages if m.get("tool_call_id") == "call_notify_vol")
     assert json.loads(tool_msg["content"]) == {"ok": False, "error": "permission denied"}
 
@@ -169,10 +189,10 @@ async def test_notify_volunteer_is_blocked_for_a_volunteer():
 @pytest.mark.asyncio
 async def test_auto_notify_after_approve_draft_notifies_each_volunteer():
     """
-    Characterizes bot.py:588-606: on a successful approve_draft with
-    volunteers_to_notify, each entry with a telegram_id and shifts gets a
-    built shift message pushed via _notify_volunteer_tool — without the
-    model having to call notify_volunteer itself.
+    On a successful approve_draft with volunteers_to_notify, each entry with
+    a telegram_id and shifts gets a built shift message pushed via
+    deps.perform("notify_volunteer", ...) — without the model having to call
+    notify_volunteer itself.
     """
     approve_call = _make_tool_call(
         tc_id="call_approve", name="approve_draft",
@@ -195,20 +215,19 @@ async def test_auto_notify_after_approve_draft_notifies_each_volunteer():
         }],
     })
 
-    with patch.object(bot._client.chat.completions, "create",
-                      side_effect=[first_response, second_response]), \
-         patch("bot._run_tool", return_value=run_tool_result), \
-         patch("bot._notify_volunteer_tool", new_callable=AsyncMock,
-               return_value=json.dumps({"ok": True, "sent_to": "111"})) as mock_notify_vol:
+    mock_call_model = _make_call_model(first_response, second_response)
+    mock_perform = _make_perform(approve_draft=run_tool_result)
 
-        result = await bot._call_grok(
-            user_id=77777, user_type="admin", internal_id="marielle", context=fake_context,
-        )
+    result = await bot._call_grok(
+        user_id=77777, user_type="admin", internal_id="marielle", context=fake_context,
+        deps=bot.Deps(call_model=mock_call_model, perform=mock_perform),
+    )
 
-    mock_notify_vol.assert_called_once()
-    tg_id, message, ctx = mock_notify_vol.call_args[0]
-    assert tg_id == "111"
-    assert "Ana" in message
+    notify_calls = _calls_for(mock_perform, "notify_volunteer")
+    assert len(notify_calls) == 1
+    tool_name, tool_args, ctx, acting_user_id = notify_calls[0].args
+    assert tool_args["telegram_id"] == "111"
+    assert "Ana" in tool_args["message"]
     assert ctx is fake_context
     assert result == "Approved and notified."
 
@@ -249,17 +268,16 @@ async def test_auto_notify_after_approve_draft_logs_incomplete_entries_since_b3(
         ],
     })
 
-    with patch.object(bot._client.chat.completions, "create",
-                      side_effect=[first_response, second_response]), \
-         patch("bot._run_tool", return_value=run_tool_result), \
-         patch("bot._notify_volunteer_tool", new_callable=AsyncMock) as mock_notify_vol:
+    mock_call_model = _make_call_model(first_response, second_response)
+    mock_perform = _make_perform(approve_draft=run_tool_result)
 
-        with caplog.at_level("WARNING"):
-            result = await bot._call_grok(
-                user_id=78888, user_type="admin", internal_id="marielle", context=fake_context,
-            )
+    with caplog.at_level("WARNING"):
+        result = await bot._call_grok(
+            user_id=78888, user_type="admin", internal_id="marielle", context=fake_context,
+            deps=bot.Deps(call_model=mock_call_model, perform=mock_perform),
+        )
 
-    mock_notify_vol.assert_not_called()
+    assert _calls_for(mock_perform, "notify_volunteer") == []
     assert result == "Approved."
 
     warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
@@ -313,25 +331,24 @@ async def test_auto_notify_isolates_a_malformed_entry_from_the_rest_of_the_batch
         ],
     })
 
-    with patch.object(bot._client.chat.completions, "create",
-                      side_effect=[first_response, second_response]), \
-         patch("bot._run_tool", return_value=run_tool_result), \
-         patch("bot._notify_volunteer_tool", new_callable=AsyncMock,
-               return_value=json.dumps({"ok": True, "sent_to": "444"})) as mock_notify_vol:
+    mock_call_model = _make_call_model(first_response, second_response)
+    mock_perform = _make_perform(approve_draft=run_tool_result)
 
-        with caplog.at_level("WARNING"):
-            result = await bot._call_grok(
-                user_id=88888, user_type="admin", internal_id="marielle", context=fake_context,
-            )
+    with caplog.at_level("WARNING"):
+        result = await bot._call_grok(
+            user_id=88888, user_type="admin", internal_id="marielle", context=fake_context,
+            deps=bot.Deps(call_model=mock_call_model, perform=mock_perform),
+        )
 
     assert result == "Approved."
 
     # The valid entry (Bob, 444) still gets notified despite its malformed
     # neighbor in the same batch.
-    mock_notify_vol.assert_called_once()
-    tg_id, message, ctx = mock_notify_vol.call_args[0]
-    assert tg_id == "444"
-    assert "Bob" in message
+    notify_calls = _calls_for(mock_perform, "notify_volunteer")
+    assert len(notify_calls) == 1
+    tool_name, tool_args, ctx, acting_user_id = notify_calls[0].args
+    assert tool_args["telegram_id"] == "444"
+    assert "Bob" in tool_args["message"]
 
     # The malformed entry is visible in the logs, not silently dropped.
     warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
@@ -343,9 +360,9 @@ async def test_auto_notify_isolates_a_malformed_entry_from_the_rest_of_the_batch
 @pytest.mark.asyncio
 async def test_max_tool_iterations_returns_fixed_fallback():
     """
-    Characterizes bot.py:527/616-618: if the model keeps requesting tool
-    calls for _MAX_TOOL_ITER turns in a row, the loop gives up and returns
-    the fixed escalation string, without ever returning plain text.
+    If the model keeps requesting tool calls for _MAX_TOOL_ITER turns in a
+    row, the loop gives up and returns the fixed escalation string, without
+    ever returning plain text.
     """
     responses = [
         _llm_response(tool_calls=[
@@ -357,16 +374,16 @@ async def test_max_tool_iterations_returns_fixed_fallback():
     fake_context = MagicMock()
     bot._history[99999] = [{"role": "user", "content": "show me everything, forever"}]
 
-    with patch.object(bot._client.chat.completions, "create",
-                      side_effect=responses) as mock_llm, \
-         patch("bot._run_tool", return_value=json.dumps({"ok": True})) as mock_run_tool:
+    mock_call_model = _make_call_model(*responses)
+    mock_perform = _make_perform()
 
-        result = await bot._call_grok(
-            user_id=99999, user_type="admin", internal_id="marielle", context=fake_context,
-        )
+    result = await bot._call_grok(
+        user_id=99999, user_type="admin", internal_id="marielle", context=fake_context,
+        deps=bot.Deps(call_model=mock_call_model, perform=mock_perform),
+    )
 
-    assert mock_llm.call_count == bot._MAX_TOOL_ITER
-    assert mock_run_tool.call_count == bot._MAX_TOOL_ITER
+    assert mock_call_model.call_count == bot._MAX_TOOL_ITER
+    assert mock_perform.call_count == bot._MAX_TOOL_ITER
     assert result == (
         "Something complex came up and I couldn't finish. "
         "I've flagged it for Moises to take a look."

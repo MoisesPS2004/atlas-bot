@@ -9,8 +9,12 @@ que devuelven.
 Hueco B (strangler-fig, por fases):
   B.1 → authorize() + pin_identity()
   B.2 → parseo de tool calls + ensamblado de mensajes assistant/tool
-  B.3 (este archivo, por ahora) → plan_post_approve_notifications()
-  B.4 → frontera de efectos (deps.perform)
+  B.3 → plan_post_approve_notifications()
+  B.4 (este archivo, por ahora) → Deps, el shape de la frontera de efectos
+B.5 (colapsar el loop de _call_grok en un intérprete puro) queda fuera de
+alcance a menos que se pida explícitamente — B.4 deja el driver en bot.py
+como shell imperativo delgado, dependiendo únicamente de Deps para tocar
+el mundo real (API del modelo, Telegram, CLI del engine).
 
 authorize() — invariantes de seguridad (Hueco B / B.1 Grill Me):
   1. Fail-closed — cualquier tool_name fuera de KNOWN_TOOL_NAMES es denegado,
@@ -31,6 +35,7 @@ authorize() — invariantes de seguridad (Hueco B / B.1 Grill Me):
 from __future__ import annotations
 
 import json
+from typing import Callable, NamedTuple
 
 ADMIN_ONLY_TOOLS = frozenset({
     "generate_draft",
@@ -183,3 +188,26 @@ def plan_post_approve_notifications(volunteers_to_notify: list) -> dict:
             "shifts": shifts,
         })
     return {"valid": valid, "invalid": invalid}
+
+
+# ─── B.4: frontera de efectos ───────────────────────────────────────────────────
+
+class Deps(NamedTuple):
+    """
+    Frontera de efectos inyectada en el driver _call_grok de bot.py. Es solo
+    el shape (0 I/O) — las implementaciones reales viven en bot.py, las
+    fakes/mocks deterministas viven en los tests.
+
+    call_model(messages) -> response
+        Única vía por la que el loop agéntico llega a la API del modelo.
+        Sync, misma firma que el SDK (el driver ya no llama a _client
+        directamente).
+
+    perform(tool_name, tool_args, context, acting_user_id) -> str (awaitable)
+        Única vía por la que el loop dispara un efecto real: Telegram
+        (notify_admins/notify_volunteer) o el CLI del engine (todo lo
+        demás). El driver ya no llama a _run_tool, _notify_admins_tool ni
+        _notify_volunteer_tool directamente — todo cruza por acá.
+    """
+    call_model: Callable
+    perform: Callable
