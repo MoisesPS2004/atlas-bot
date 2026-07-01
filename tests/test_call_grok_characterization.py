@@ -88,7 +88,7 @@ async def test_unknown_tool_name_is_denied_fail_closed():
     second_response = _llm_response(tool_calls=None, content="done")
 
     fake_context = MagicMock()
-    bot._history[44444] = [{"role": "user", "content": "do the thing"}]
+    bot._store.append_history(44444, "user", "do the thing")
 
     mock_call_model = _make_call_model(first_response, second_response)
     mock_perform = _make_perform()
@@ -131,7 +131,7 @@ async def test_notify_admins_is_blocked_for_a_volunteer_since_b1():
     second_response = _llm_response(tool_calls=None, content="I can't do that.")
 
     fake_context = MagicMock()
-    bot._history[55555] = [{"role": "user", "content": "tell the admins"}]
+    bot._store.append_history(55555, "user", "tell the admins")
 
     mock_call_model = _make_call_model(first_response, second_response)
     mock_perform = _make_perform()
@@ -166,7 +166,7 @@ async def test_notify_volunteer_is_blocked_for_a_volunteer():
     second_response = _llm_response(tool_calls=None, content="I can't do that.")
 
     fake_context = MagicMock()
-    bot._history[66666] = [{"role": "user", "content": "message this volunteer"}]
+    bot._store.append_history(66666, "user", "message this volunteer")
 
     mock_call_model = _make_call_model(first_response, second_response)
     mock_perform = _make_perform()
@@ -202,7 +202,7 @@ async def test_auto_notify_after_approve_draft_notifies_each_volunteer():
     second_response = _llm_response(tool_calls=None, content="Approved and notified.")
 
     fake_context = MagicMock()
-    bot._history[77777] = [{"role": "user", "content": "approve the draft"}]
+    bot._store.append_history(77777, "user", "approve the draft")
 
     run_tool_result = json.dumps({
         "ok": True,
@@ -256,7 +256,7 @@ async def test_auto_notify_after_approve_draft_logs_incomplete_entries_since_b3(
     second_response = _llm_response(tool_calls=None, content="Approved.")
 
     fake_context = MagicMock()
-    bot._history[78888] = [{"role": "user", "content": "approve the draft"}]
+    bot._store.append_history(78888, "user", "approve the draft")
 
     run_tool_result = json.dumps({
         "ok": True,
@@ -310,7 +310,7 @@ async def test_auto_notify_isolates_a_malformed_entry_from_the_rest_of_the_batch
     second_response = _llm_response(tool_calls=None, content="Approved.")
 
     fake_context = MagicMock()
-    bot._history[88888] = [{"role": "user", "content": "approve the draft"}]
+    bot._store.append_history(88888, "user", "approve the draft")
 
     run_tool_result = json.dumps({
         "ok": True,
@@ -372,7 +372,7 @@ async def test_max_tool_iterations_returns_fixed_fallback():
     ]
 
     fake_context = MagicMock()
-    bot._history[99999] = [{"role": "user", "content": "show me everything, forever"}]
+    bot._store.append_history(99999, "user", "show me everything, forever")
 
     mock_call_model = _make_call_model(*responses)
     mock_perform = _make_perform()

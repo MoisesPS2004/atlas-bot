@@ -7,6 +7,7 @@ from pathlib import Path
 
 from openai import OpenAI
 from log_policy import apply_secret_safe_logging
+from conversation_store import ConversationStore
 from training_callbacks import handle_training_callback
 from call_grok_core import (
     authorize,
@@ -37,7 +38,6 @@ _SOUL_PATH  = Path("/home/moises/aquarela/atlas_soul.md")
 _DB_PATH    = "/home/moises/aquarela/aquarela.db"
 _ENGINE_PY  = "/home/moises/aquarela/.venv/bin/python"
 _ENGINE_CLI = "/home/moises/aquarela/aquarela_cli.py"
-_MAX_HISTORY   = 10   # messages per user kept in memory
 _MAX_TOOL_ITER = 5    # max agentic loops before escalating
 
 # ─── Load .env ───────────────────────────────────────────────────────────────
@@ -522,15 +522,12 @@ def _load_admin_ids() -> set[int]:
         logger.warning(f"Could not load admin IDs: {e}")
     return ids
 
-# ─── Conversation history ─────────────────────────────────────────────────────
-_history: dict[int, list[dict]] = {}
-
-def _add_to_history(user_id: int, role: str, content: str) -> None:
-    if user_id not in _history:
-        _history[user_id] = []
-    _history[user_id].append({"role": role, "content": content})
-    if len(_history[user_id]) > _MAX_HISTORY:
-        _history[user_id] = _history[user_id][-_MAX_HISTORY:]
+# ─── Conversation history (Hueco G) ───────────────────────────────────────────
+# Bound in-memory conversation state behind a deep module: per-user length cap,
+# LRU + lazy-TTL eviction, and a per-user turn lock. Deliberately volatile —
+# ephemeral scratch for the agentic loop, not a system of record (that lives in
+# aquarela.db). Lost on restart by conscious trade-off. See conversation_store.py.
+_store = ConversationStore()
 
 # ─── Effects boundary (Hueco B / B.4) ─────────────────────────────────────────
 # Production implementations of call_grok_core.Deps. The agentic loop below
@@ -566,7 +563,7 @@ _PROD_DEPS = Deps(call_model=_call_model, perform=_perform)
 async def _call_grok(user_id: int, user_type: str, internal_id: int | str, context, deps: Deps) -> str:
     """Run the agentic loop. Returns final text reply."""
     system = SOUL + f"\n\n---\nCurrent user: {user_type} (internal_id={internal_id}, telegram_id={user_id})"
-    messages = [{"role": "system", "content": system}] + _history[user_id]
+    messages = [{"role": "system", "content": system}] + _store.get_history(user_id)
 
     for iteration in range(_MAX_TOOL_ITER):
         response = deps.call_model(messages)
@@ -649,16 +646,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     user_type, internal_id = access
 
-    # Add to history and call Grok
-    _add_to_history(user_id, "user", text)
-    try:
-        reply = await _call_grok(user_id, user_type, internal_id, context, deps=_PROD_DEPS)
-    except Exception as e:
-        logger.error(f"Grok call failed for user {user_id}: {e}")
-        reply = "Something went wrong on my end. Please try again in a moment."
+    # Serialize the whole turn per user: a burst of concurrent messages from the
+    # same telegram_id must not interleave across the awaited model call and
+    # corrupt the history order sent to Grok (Hueco G).
+    async with _store.lock(user_id):
+        _store.append_history(user_id, "user", text)
+        try:
+            reply = await _call_grok(user_id, user_type, internal_id, context, deps=_PROD_DEPS)
+        except Exception as e:
+            logger.error(f"Grok call failed for user {user_id}: {e}")
+            reply = "Something went wrong on my end. Please try again in a moment."
 
-    _add_to_history(user_id, "assistant", reply)
-    await update.message.reply_text(reply)
+        _store.append_history(user_id, "assistant", reply)
+        await update.message.reply_text(reply)
 
 async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start, /help, /status commands with a friendly plain-text response."""

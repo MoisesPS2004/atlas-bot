@@ -75,7 +75,7 @@ async def test_volunteer_cannot_spoof_volunteer_id_in_save_preferences():
     deps = _make_deps(first_response, second_response, perform_result=json.dumps({"ok": True}))
 
     # Pre-seed history so _call_grok doesn't blow up on missing key
-    bot._history[11111] = [{"role": "user", "content": "Set my preferences to avoid day reception"}]
+    bot._store.append_history(11111, "user", "Set my preferences to avoid day reception")
 
     await bot._call_grok(
         user_id=11111,
@@ -117,7 +117,7 @@ async def test_volunteer_cannot_call_admin_only_tools():
 
     fake_context = MagicMock()
     deps = _make_deps(first_response, second_response)
-    bot._history[22222] = [{"role": "user", "content": "Approve the schedule"}]
+    bot._store.append_history(22222, "user", "Approve the schedule")
 
     await bot._call_grok(
         user_id=22222,
@@ -151,7 +151,7 @@ async def test_volunteer_save_preferences_with_correct_id_passes():
 
     fake_context = MagicMock()
     deps = _make_deps(first_response, second_response, perform_result=json.dumps({"ok": True}))
-    bot._history[33333] = [{"role": "user", "content": "I like day reception"}]
+    bot._store.append_history(33333, "user", "I like day reception")
 
     await bot._call_grok(
         user_id=33333,
