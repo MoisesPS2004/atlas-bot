@@ -85,16 +85,33 @@ def authorize(user_type: str, tool_name: str) -> tuple[bool, str | None]:
     return True, None
 
 
-def pin_identity(user_type: str, tool_name: str, tool_args: dict, internal_id) -> dict:
+def pin_identity(
+    user_type: str,
+    tool_name: str,
+    tool_args: dict,
+    internal_id,
+    caller_telegram_id=None,
+) -> dict:
     """
     Pinea los campos de identidad self-service a la sesión autenticada — el
     LLM nunca debe ser la autoridad sobre quién es el llamante.
 
     No muta tool_args; retorna un dict nuevo cuando aplica una regla de
     pinning, o el mismo dict recibido cuando no aplica ninguna.
+
+    caller_telegram_id es el telegram_id del llamante (user_id de Telegram);
+    es opcional para compatibilidad hacia atrás. Solo lo consumen las reglas
+    de disclosure entre voluntarios (Hueco F).
     """
     if user_type == "volunteer" and tool_name == "save_preferences":
         return {**tool_args, "volunteer_id": internal_id}
+    # Hueco F — disclosure entre voluntarios: un voluntario solo puede resolver
+    # su PROPIO registro. Bind, no check: descartamos por completo cualquier
+    # criterio ajeno (name / telegram_id de terceros) que el LLM haya inyectado
+    # y atamos la consulta a caller_telegram_id. La query insegura queda
+    # estructuralmente irrepresentable (fail-closed por construcción).
+    if user_type == "volunteer" and tool_name == "show_volunteer":
+        return {"telegram_id": caller_telegram_id}
     return tool_args
 
 

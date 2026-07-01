@@ -583,7 +583,7 @@ async def _call_grok(user_id: int, user_type: str, internal_id: int | str, conte
             tool_args = parse_tool_call_args(tc.function.arguments)
             # Pin self-service identity fields to the authenticated session —
             # the LLM must never be the authority on who the caller is.
-            tool_args = pin_identity(user_type, tc.function.name, tool_args, internal_id)
+            tool_args = pin_identity(user_type, tc.function.name, tool_args, internal_id, user_id)
 
             allowed, deny_reason = authorize(user_type, tc.function.name)
             if not allowed:
