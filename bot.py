@@ -7,6 +7,16 @@ from pathlib import Path
 
 from openai import OpenAI
 from training_callbacks import handle_training_callback
+from call_grok_core import (
+    authorize,
+    pin_identity,
+    parse_tool_call_args,
+    build_assistant_tool_calls_message,
+    build_tool_result_message,
+    build_denial_result,
+    plan_post_approve_notifications,
+    Deps,
+)
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
@@ -312,18 +322,6 @@ TOOLS = [
     },
 ]
 
-_ADMIN_ONLY_TOOLS = {
-    "generate_draft",
-    "delete_draft",
-    "approve_draft",
-    "deactivate_volunteer",
-    "update_volunteer_dates",
-    "list_volunteers",
-    "confirm_training",
-    "report_no_show",
-    "schedule_admin_training",
-}
-
 SHIFT_NAMES = {
     "breakfast":            {"en": "Breakfast (6:00–10:00)",           "es": "Desayuno (6:00–10:00)",            "pt": "Café da manhã (6:00–10:00)",       "fr": "Petit-déjeuner (6:00–10:00)"},
     "breakfast_support":    {"en": "Breakfast Support (8:00–12:00)",   "es": "Apoyo desayuno (8:00–12:00)",      "pt": "Apoio café (8:00–12:00)",          "fr": "Support petit-déj (8:00–12:00)"},
@@ -518,19 +516,44 @@ def _add_to_history(user_id: int, role: str, content: str) -> None:
     if len(_history[user_id]) > _MAX_HISTORY:
         _history[user_id] = _history[user_id][-_MAX_HISTORY:]
 
+# ─── Effects boundary (Hueco B / B.4) ─────────────────────────────────────────
+# Production implementations of call_grok_core.Deps. The agentic loop below
+# never calls _client, _run_tool, _notify_admins_tool or _notify_volunteer_tool
+# directly — everything crosses through these two functions.
+
+def _call_model(messages: list) -> object:
+    """Production call_model: hits the model via the OpenAI-compatible client."""
+    return _client.chat.completions.create(
+        model="x-ai/grok-4.3",
+        messages=messages,
+        tools=TOOLS,
+        tool_choice="auto",
+    )
+
+
+async def _perform(tool_name: str, tool_args: dict, context, acting_user_id: int) -> str:
+    """Production perform: routes a tool call to its real side effect (Telegram or the engine CLI)."""
+    if tool_name == "notify_admins":
+        return await _notify_admins_tool(
+            tool_args.get("message", ""), context, acting_user_id=acting_user_id,
+        )
+    if tool_name == "notify_volunteer":
+        return await _notify_volunteer_tool(
+            tool_args.get("telegram_id", ""), tool_args.get("message", ""), context,
+        )
+    return _run_tool(tool_name, tool_args)
+
+
+_PROD_DEPS = Deps(call_model=_call_model, perform=_perform)
+
 # ─── Grok call ────────────────────────────────────────────────────────────────
-async def _call_grok(user_id: int, user_type: str, internal_id: int | str, context) -> str:
+async def _call_grok(user_id: int, user_type: str, internal_id: int | str, context, deps: Deps) -> str:
     """Run the agentic loop. Returns final text reply."""
     system = SOUL + f"\n\n---\nCurrent user: {user_type} (internal_id={internal_id}, telegram_id={user_id})"
     messages = [{"role": "system", "content": system}] + _history[user_id]
 
     for iteration in range(_MAX_TOOL_ITER):
-        response = _client.chat.completions.create(
-            model="x-ai/grok-4.3",
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-        )
+        response = deps.call_model(messages)
         msg = response.choices[0].message
 
         # No tool call — Grok replied with text
@@ -538,80 +561,58 @@ async def _call_grok(user_id: int, user_type: str, internal_id: int | str, conte
             return msg.content or "..."
 
         # Tool calls — run each one and feed results back
-        messages.append({"role": "assistant", "content": msg.content or "", "tool_calls": [
-            {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-            for tc in msg.tool_calls
-        ]})
+        messages.append(build_assistant_tool_calls_message(msg.content, msg.tool_calls))
         approve_ran_this_turn = False
         for tc in msg.tool_calls:
-            tool_args = json.loads(tc.function.arguments)
+            tool_args = parse_tool_call_args(tc.function.arguments)
             # Pin self-service identity fields to the authenticated session —
             # the LLM must never be the authority on who the caller is.
-            if user_type == "volunteer" and tc.function.name == "save_preferences":
-                tool_args["volunteer_id"] = internal_id
-            # Enforce admin-only tools
-            if user_type == "volunteer" and tc.function.name in _ADMIN_ONLY_TOOLS:
-                logger.warning(f"Volunteer {user_id} attempted admin tool {tc.function.name} — blocked")
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": json.dumps({"ok": False, "error": "permission denied: this action is for admins only"}),
-                })
+            tool_args = pin_identity(user_type, tc.function.name, tool_args, internal_id)
+
+            allowed, deny_reason = authorize(user_type, tc.function.name)
+            if not allowed:
+                logger.warning(f"{user_type} {user_id} denied for tool {tc.function.name}: {deny_reason}")
+                messages.append(build_tool_result_message(tc.id, build_denial_result(deny_reason)))
                 continue
 
-            # notify_volunteer may only be triggered by an admin context (Atlas-only after approval)
-            if tc.function.name == "notify_volunteer" and user_type == "volunteer":
-                logger.warning(f"Volunteer {user_id} attempted notify_volunteer — blocked")
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": json.dumps({"ok": False, "error": "permission denied"}),
-                })
-                continue
             if tc.function.name == "notify_admins":
-                tool_result = await _notify_admins_tool(
-                    tool_args.get("message", ""), context, acting_user_id=user_id
-                )
+                tool_result = await deps.perform("notify_admins", tool_args, context, user_id)
             elif tc.function.name == "notify_volunteer":
                 if approve_ran_this_turn:
                     logger.info("Skipping notify_volunteer — auto-notify already handled this turn")
                     tool_result = json.dumps({"ok": True, "note": "already auto-notified"})
                 else:
-                    tool_result = await _notify_volunteer_tool(
-                        tool_args.get("telegram_id", ""),
-                        tool_args.get("message", ""),
-                        context,
-                    )
+                    tool_result = await deps.perform("notify_volunteer", tool_args, context, user_id)
             else:
-                tool_result = _run_tool(tc.function.name, tool_args)
+                tool_result = await deps.perform(tc.function.name, tool_args, context, user_id)
                 # Auto-notify volunteers when approve_draft succeeds
                 if tc.function.name == "approve_draft":
-                    try:
-                        result_data = json.loads(tool_result)
-                        if result_data.get("ok"):
-                            approve_ran_this_turn = True
-                        if result_data.get("ok") and result_data.get("volunteers_to_notify"):
-                            notified = 0
-                            for vol in result_data["volunteers_to_notify"]:
-                                tg_id = vol.get("telegram_id")
-                                name  = vol.get("name", "").split()[0]
-                                lang  = vol.get("language", "en")
-                                week  = result_data.get("week", "")
-                                shifts = vol.get("shifts", [])
-                                if not tg_id or not shifts:
-                                    continue
-                                msg = _build_shift_message(name, week, shifts, lang)
-                                await _notify_volunteer_tool(tg_id, msg, context)
-                                notified += 1
-                            logger.info(f"Auto-notified {notified} volunteers after approve_draft")
-                    except Exception as e:
-                        logger.error(f"Auto-notify after approve_draft failed: {e}")
+                    result_data = json.loads(tool_result)
+                    if result_data.get("ok"):
+                        approve_ran_this_turn = True
+                    if result_data.get("ok") and result_data.get("volunteers_to_notify"):
+                        plan = plan_post_approve_notifications(result_data["volunteers_to_notify"])
+                        for skipped in plan["invalid"]:
+                            logger.warning(
+                                f"Skipping malformed volunteer notification entry "
+                                f"({skipped['reason']}): {skipped['entry']!r}"
+                            )
+                        week = result_data.get("week", "")
+                        notified = 0
+                        for vol in plan["valid"]:
+                            notify_text = _build_shift_message(vol["name"], week, vol["shifts"], vol["language"])
+                            await deps.perform(
+                                "notify_volunteer",
+                                {"telegram_id": vol["telegram_id"], "message": notify_text},
+                                context, user_id,
+                            )
+                            notified += 1
+                        logger.info(
+                            f"Auto-notified {notified} volunteers after approve_draft"
+                            + (f", skipped {len(plan['invalid'])} malformed entries" if plan["invalid"] else "")
+                        )
             logger.info(f"Tool {tc.function.name} result: {tool_result[:200]}")
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": tool_result,
-            })
+            messages.append(build_tool_result_message(tc.id, tool_result))
 
     # Reached max iterations
     logger.warning(f"Max tool iterations reached for user {user_id}")
@@ -635,7 +636,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Add to history and call Grok
     _add_to_history(user_id, "user", text)
     try:
-        reply = await _call_grok(user_id, user_type, internal_id, context)
+        reply = await _call_grok(user_id, user_type, internal_id, context, deps=_PROD_DEPS)
     except Exception as e:
         logger.error(f"Grok call failed for user {user_id}: {e}")
         reply = "Something went wrong on my end. Please try again in a moment."
