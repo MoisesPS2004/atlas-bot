@@ -213,16 +213,21 @@ async def test_auto_notify_after_approve_draft_notifies_each_volunteer():
     assert result == "Approved and notified."
 
 
-# ─── Case 4b: auto-notify after approve_draft — incomplete entry is skipped ────
+# ─── Case 4b: auto-notify after approve_draft — incomplete entries are logged ──
 
 @pytest.mark.asyncio
-async def test_auto_notify_after_approve_draft_silently_skips_incomplete_entries():
+async def test_auto_notify_after_approve_draft_logs_incomplete_entries_since_b3(caplog):
     """
-    ⚠️ TODAY'S BEHAVIOR: bot.py:601-602 (`if not tg_id or not shifts: continue`)
-    drops a volunteer entry with no error surfaced anywhere — not to the admin,
-    not to the model, only a line that never gets logged because the loop just
-    continues. This is part of what B.3's plan_post_approve_notifications is
-    meant to make visible instead of silent.
+    FIXED IN B.3 — before this phase, `if not tg_id or not shifts: continue`
+    dropped a volunteer entry with no error surfaced anywhere: not to the
+    admin, not to the model, not even to the logs (see B.0's original
+    version of this test, named "silently_skips").
+
+    Since B.3, call_grok_core.plan_post_approve_notifications() classifies
+    each entry and returns the invalid ones with a reason; bot.py logs a
+    warning for each one instead of dropping it silently. The volunteers
+    still don't get a Telegram message (there's nothing valid to send), but
+    the failure is now visible in the logs.
     """
     approve_call = _make_tool_call(
         tc_id="call_approve_incomplete", name="approve_draft",
@@ -249,26 +254,35 @@ async def test_auto_notify_after_approve_draft_silently_skips_incomplete_entries
          patch("bot._run_tool", return_value=run_tool_result), \
          patch("bot._notify_volunteer_tool", new_callable=AsyncMock) as mock_notify_vol:
 
-        result = await bot._call_grok(
-            user_id=78888, user_type="admin", internal_id="marielle", context=fake_context,
-        )
+        with caplog.at_level("WARNING"):
+            result = await bot._call_grok(
+                user_id=78888, user_type="admin", internal_id="marielle", context=fake_context,
+            )
 
     mock_notify_vol.assert_not_called()
     assert result == "Approved."
 
+    warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+    assert any("missing telegram_id" in w for w in warnings)
+    assert any("missing shifts" in w for w in warnings)
 
-# ─── Case 5: exception in post-approve notification is swallowed ──────────────
+
+# ─── Case 5: a malformed entry no longer takes down the whole batch ───────────
 
 @pytest.mark.asyncio
-async def test_auto_notify_exception_is_swallowed_and_loop_continues():
+async def test_auto_notify_isolates_a_malformed_entry_from_the_rest_of_the_batch(caplog):
     """
-    ⚠️ TODAY'S BEHAVIOR: bot.py:589/607-608 wraps the whole post-approve
-    notification block in `except Exception as e: logger.error(...)` with no
-    re-raise and no error surfaced in the tool_result already appended to the
-    loop. A volunteer entry missing "name" makes
-    `vol.get("name", "").split()[0]` raise IndexError — and _call_grok simply
-    keeps going as if approve_draft had fully succeeded. This is the exact
-    swallow B.3 (plan_post_approve_notifications) is scoped to eliminate.
+    FIXED IN B.3 — before this phase, one volunteer entry missing "name"
+    made `vol.get("name", "").split()[0]` raise IndexError, caught by a
+    generic `except Exception` that wrapped the WHOLE post-approve block —
+    not just that one entry. That silently aborted notifications for EVERY
+    volunteer in the same approve_draft batch, including ones after the bad
+    entry that were otherwise perfectly valid (see B.0's original version
+    of this test, named "..._is_swallowed_and_loop_continues").
+
+    Since B.3, plan_post_approve_notifications() never raises: it evaluates
+    each entry independently. A malformed entry is skipped and logged; every
+    other, valid entry in the same batch still gets notified.
     """
     approve_call = _make_tool_call(
         tc_id="call_approve_boom", name="approve_draft",
@@ -283,28 +297,45 @@ async def test_auto_notify_exception_is_swallowed_and_loop_continues():
     run_tool_result = json.dumps({
         "ok": True,
         "week": "2026-07-06",
-        "volunteers_to_notify": [{
-            # no "name" key at all -> "".split()[0] raises IndexError inside
-            # the try/except at bot.py:589-608.
-            "telegram_id": "333",
-            "shifts": [{"date": "2026-07-06", "type": "breakfast"}],
-        }],
+        "volunteers_to_notify": [
+            {
+                # No "name" key at all — used to raise IndexError and take
+                # down the whole batch (see docstring above).
+                "telegram_id": "333",
+                "shifts": [{"date": "2026-07-06", "type": "breakfast"}],
+            },
+            {
+                "telegram_id": "444",
+                "name": "Bob Volunteer",
+                "language": "en",
+                "shifts": [{"date": "2026-07-06", "type": "breakfast"}],
+            },
+        ],
     })
 
     with patch.object(bot._client.chat.completions, "create",
                       side_effect=[first_response, second_response]), \
          patch("bot._run_tool", return_value=run_tool_result), \
-         patch("bot._notify_volunteer_tool", new_callable=AsyncMock) as mock_notify_vol:
+         patch("bot._notify_volunteer_tool", new_callable=AsyncMock,
+               return_value=json.dumps({"ok": True, "sent_to": "444"})) as mock_notify_vol:
 
-        # Must NOT raise — the IndexError is caught inside _call_grok today.
-        result = await bot._call_grok(
-            user_id=88888, user_type="admin", internal_id="marielle", context=fake_context,
-        )
+        with caplog.at_level("WARNING"):
+            result = await bot._call_grok(
+                user_id=88888, user_type="admin", internal_id="marielle", context=fake_context,
+            )
 
-    # The crash happens before _notify_volunteer_tool is reached for this
-    # entry, so the volunteer silently never gets notified.
-    mock_notify_vol.assert_not_called()
     assert result == "Approved."
+
+    # The valid entry (Bob, 444) still gets notified despite its malformed
+    # neighbor in the same batch.
+    mock_notify_vol.assert_called_once()
+    tg_id, message, ctx = mock_notify_vol.call_args[0]
+    assert tg_id == "444"
+    assert "Bob" in message
+
+    # The malformed entry is visible in the logs, not silently dropped.
+    warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+    assert any("missing name" in w for w in warnings)
 
 
 # ─── Case 6: max tool iterations reached — fixed fallback string ──────────────

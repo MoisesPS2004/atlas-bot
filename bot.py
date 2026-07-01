@@ -14,6 +14,7 @@ from call_grok_core import (
     build_assistant_tool_calls_message,
     build_tool_result_message,
     build_denial_result,
+    plan_post_approve_notifications,
 )
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -566,26 +567,26 @@ async def _call_grok(user_id: int, user_type: str, internal_id: int | str, conte
                 tool_result = _run_tool(tc.function.name, tool_args)
                 # Auto-notify volunteers when approve_draft succeeds
                 if tc.function.name == "approve_draft":
-                    try:
-                        result_data = json.loads(tool_result)
-                        if result_data.get("ok"):
-                            approve_ran_this_turn = True
-                        if result_data.get("ok") and result_data.get("volunteers_to_notify"):
-                            notified = 0
-                            for vol in result_data["volunteers_to_notify"]:
-                                tg_id = vol.get("telegram_id")
-                                name  = vol.get("name", "").split()[0]
-                                lang  = vol.get("language", "en")
-                                week  = result_data.get("week", "")
-                                shifts = vol.get("shifts", [])
-                                if not tg_id or not shifts:
-                                    continue
-                                msg = _build_shift_message(name, week, shifts, lang)
-                                await _notify_volunteer_tool(tg_id, msg, context)
-                                notified += 1
-                            logger.info(f"Auto-notified {notified} volunteers after approve_draft")
-                    except Exception as e:
-                        logger.error(f"Auto-notify after approve_draft failed: {e}")
+                    result_data = json.loads(tool_result)
+                    if result_data.get("ok"):
+                        approve_ran_this_turn = True
+                    if result_data.get("ok") and result_data.get("volunteers_to_notify"):
+                        plan = plan_post_approve_notifications(result_data["volunteers_to_notify"])
+                        for skipped in plan["invalid"]:
+                            logger.warning(
+                                f"Skipping malformed volunteer notification entry "
+                                f"({skipped['reason']}): {skipped['entry']!r}"
+                            )
+                        week = result_data.get("week", "")
+                        notified = 0
+                        for vol in plan["valid"]:
+                            notify_text = _build_shift_message(vol["name"], week, vol["shifts"], vol["language"])
+                            await _notify_volunteer_tool(vol["telegram_id"], notify_text, context)
+                            notified += 1
+                        logger.info(
+                            f"Auto-notified {notified} volunteers after approve_draft"
+                            + (f", skipped {len(plan['invalid'])} malformed entries" if plan["invalid"] else "")
+                        )
             logger.info(f"Tool {tc.function.name} result: {tool_result[:200]}")
             messages.append(build_tool_result_message(tc.id, tool_result))
 

@@ -8,9 +8,8 @@ que devuelven.
 
 Hueco B (strangler-fig, por fases):
   B.1 → authorize() + pin_identity()
-  B.2 (este archivo, por ahora) → parseo de tool calls + ensamblado de
-       mensajes assistant/tool
-  B.3 → plan_post_approve_notifications()
+  B.2 → parseo de tool calls + ensamblado de mensajes assistant/tool
+  B.3 (este archivo, por ahora) → plan_post_approve_notifications()
   B.4 → frontera de efectos (deps.perform)
 
 authorize() — invariantes de seguridad (Hueco B / B.1 Grill Me):
@@ -132,3 +131,55 @@ def build_tool_result_message(tool_call_id: str, content: str) -> dict:
 def build_denial_result(error: str) -> str:
     """Codifica en JSON una denegación de authorize() en la forma {"ok": false, "error": ...} que el modelo espera como tool_result."""
     return json.dumps({"ok": False, "error": error})
+
+
+# ─── B.3: plan_post_approve_notifications ──────────────────────────────────────
+
+def plan_post_approve_notifications(volunteers_to_notify: list) -> dict:
+    """
+    Triaje puro de la lista volunteers_to_notify de un approve_draft exitoso.
+
+    Antes de B.3, una entrada sin "name" disparaba
+    `vol.get("name", "").split()[0]` -> IndexError, capturado por un
+    except Exception genérico que envolvía TODO el bloque de post-approve
+    (no solo esa entrada) — así que una única entrada malformada abortaba
+    en silencio las notificaciones de TODO el lote, incluidas las entradas
+    válidas que venían después (ver B.0 Caso 5). Esta función nunca lanza:
+    cada entrada se evalúa de forma independiente y se clasifica, así que
+    una entrada inválida no afecta el procesamiento del resto.
+
+    No toca red, no conoce telegram_id como concepto de I/O — solo evalúa
+    los datos ya presentes en cada entrada.
+
+    Retorna {"valid": [...], "invalid": [...]}.
+      - valid: dicts con {"telegram_id", "name", "language", "shifts"},
+        listos para _build_shift_message + _notify_volunteer_tool. "name"
+        ya viene reducido al primer nombre (mismo recorte que el driver
+        original).
+      - invalid: dicts con {"entry": <dict original>, "reason": str} — el
+        shell debe loguearlas de forma visible, no descartarlas en silencio.
+    """
+    valid: list = []
+    invalid: list = []
+    for vol in volunteers_to_notify:
+        tg_id  = vol.get("telegram_id")
+        shifts = vol.get("shifts", [])
+        name   = vol.get("name", "")
+
+        if not tg_id:
+            invalid.append({"entry": vol, "reason": "missing telegram_id"})
+            continue
+        if not shifts:
+            invalid.append({"entry": vol, "reason": "missing shifts"})
+            continue
+        if not name.strip():
+            invalid.append({"entry": vol, "reason": "missing name"})
+            continue
+
+        valid.append({
+            "telegram_id": tg_id,
+            "name": name.split()[0],
+            "language": vol.get("language", "en"),
+            "shifts": shifts,
+        })
+    return {"valid": valid, "invalid": invalid}
