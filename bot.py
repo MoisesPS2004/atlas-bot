@@ -1,13 +1,14 @@
+import asyncio
 import os
 import json
 import logging
 import sqlite3
-import subprocess
 from pathlib import Path
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 from log_policy import apply_secret_safe_logging
 from conversation_store import ConversationStore
+from engine_runner import EngineRunner
 from training_callbacks import handle_training_callback
 from call_grok_core import (
     authorize,
@@ -39,6 +40,14 @@ _DB_PATH    = "/home/moises/aquarela/aquarela.db"
 _ENGINE_PY  = "/home/moises/aquarela/.venv/bin/python"
 _ENGINE_CLI = "/home/moises/aquarela/aquarela_cli.py"
 _MAX_TOOL_ITER = 5    # max agentic loops before escalating
+# Hueco H — presupuesto duro para un turno completo: aun con timeout por
+# llamada, el peor caso encadenado (5 iteraciones × modelo + CLI) sostendría
+# el lock por-usuario ~6 min. Al dispararse, el usuario recibe _TIMEOUT_REPLY.
+_TURN_DEADLINE = 120  # seconds
+_TIMEOUT_REPLY = (
+    "This is taking me longer than usual, so I stopped this attempt. "
+    "Please try again in a moment."
+)
 
 # ─── Load .env ───────────────────────────────────────────────────────────────
 def _load_env() -> dict:
@@ -57,9 +66,15 @@ OPENROUTER_API_KEY = ENV["OPENROUTER_API_KEY"]
 _MOISES_ID         = int(ENV.get("MOISES_TELEGRAM_ID", "8632082731"))
 
 # ─── OpenAI client (OpenRouter) ──────────────────────────────────────────────
-_client = OpenAI(
+# Hueco H: cliente async con timeout explícito — el default del SDK es
+# read=600s, inaceptable sosteniendo el lock de turno del usuario. Sin
+# reintentos del SDK: fail-fast acá; la política deliberada de retry/backoff
+# es la Sesión 12 (Hueco J).
+_client = AsyncOpenAI(
     api_key=ENV["OPENROUTER_API_KEY"],
     base_url="https://openrouter.ai/api/v1",
+    timeout=45.0,
+    max_retries=0,
 )
 
 # ─── SOUL ────────────────────────────────────────────────────────────────────
@@ -396,7 +411,7 @@ def _build_shift_message(name: str, week: str, shifts: list, lang: str) -> str:
 
 async def _notify_admins_tool(message: str, context, acting_user_id: int = 0) -> str:
     """Send a notification to all admins except the one currently acting. Used as a tool by Grok."""
-    admin_ids = _load_admin_ids()
+    admin_ids = await asyncio.to_thread(_load_admin_ids)
     sent = 0
     for admin_id in admin_ids:
         if admin_id == acting_user_id:
@@ -424,12 +439,20 @@ async def _notify_volunteer_tool(telegram_id: str, message: str, context) -> str
         return json.dumps({"ok": False, "error": str(e)})
 
 # ─── Engine tool runner ───────────────────────────────────────────────────────
-def _run_tool(name: str, args: dict) -> str:
+# Hueco H — todas las invocaciones al engine cruzan por UN runner async:
+# subprocess nativo de asyncio (cero hilos), kill+reap en timeout, y semáforo
+# global de procesos engine en vuelo. El loop bloqueante serializaba el CLI
+# por accidente; el semáforo hace esa cota explícita para que los escritores
+# WAL concurrentes queden bajo el busy-timeout de 5s del engine (ver
+# engine_runner.py). El engine no se toca (Hueco A).
+_ENGINE = EngineRunner(max_concurrent=4)
+
+async def _run_tool(name: str, args: dict) -> str:
     """Call the engine CLI with the given tool name and args. Returns JSON string."""
     # Hueco D — frontera del proceso: cada valor del LLM se sanea por la
     # semántica del nombre de su argumento ANTES de construir argv. Fail-closed:
     # un valor mal formado o con forma de flag ("--data", "-rf") se rechaza acá
-    # y nunca llega a subprocess.run. Ver call_grok_core.sanitize_tool_args.
+    # y nunca llega al runner. Ver call_grok_core.sanitize_tool_args.
     try:
         args = sanitize_tool_args(args)
     except ValidationError as e:
@@ -469,15 +492,7 @@ def _run_tool(name: str, args: dict) -> str:
     }
     if name not in cmd_map:
         return json.dumps({"ok": False, "error": f"unknown tool: {name}"})
-    try:
-        result = subprocess.run(
-            [_ENGINE_PY, _ENGINE_CLI] + cmd_map[name],
-            capture_output=True, text=True, timeout=30,
-        )
-        return result.stdout.strip() or json.dumps({"ok": False, "error": "empty output"})
-    except Exception as e:
-        logger.error(f"Tool {name} failed: {e}")
-        return json.dumps({"ok": False, "error": str(e)})
+    return await _ENGINE.run([_ENGINE_PY, _ENGINE_CLI] + cmd_map[name], timeout=30)
 
 # ─── Access control ───────────────────────────────────────────────────────────
 def _check_access(telegram_id: int) -> tuple[str, int | str] | None:
@@ -522,6 +537,21 @@ def _load_admin_ids() -> set[int]:
         logger.warning(f"Could not load admin IDs: {e}")
     return ids
 
+def _load_volunteer_language(telegram_id: int) -> str:
+    """Volunteer's language code from DB; 'en' if unknown or on error."""
+    try:
+        conn = sqlite3.connect(_DB_PATH)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT language FROM volunteers WHERE telegram_id = ?", (str(telegram_id),)
+        ).fetchone()
+        conn.close()
+        if row and row["language"]:
+            return row["language"]
+    except Exception as e:
+        logger.error(f"Could not load language for {telegram_id}: {e}")
+    return "en"
+
 # ─── Conversation history (Hueco G) ───────────────────────────────────────────
 # Bound in-memory conversation state behind a deep module: per-user length cap,
 # LRU + lazy-TTL eviction, and a per-user turn lock. Deliberately volatile —
@@ -534,9 +564,9 @@ _store = ConversationStore()
 # never calls _client, _run_tool, _notify_admins_tool or _notify_volunteer_tool
 # directly — everything crosses through these two functions.
 
-def _call_model(messages: list) -> object:
-    """Production call_model: hits the model via the OpenAI-compatible client."""
-    return _client.chat.completions.create(
+async def _call_model(messages: list) -> object:
+    """Production call_model: hits the model via the async OpenAI-compatible client (Hueco H)."""
+    return await _client.chat.completions.create(
         model="x-ai/grok-4.3",
         messages=messages,
         tools=TOOLS,
@@ -554,7 +584,7 @@ async def _perform(tool_name: str, tool_args: dict, context, acting_user_id: int
         return await _notify_volunteer_tool(
             tool_args.get("telegram_id", ""), tool_args.get("message", ""), context,
         )
-    return _run_tool(tool_name, tool_args)
+    return await _run_tool(tool_name, tool_args)
 
 
 _PROD_DEPS = Deps(call_model=_call_model, perform=_perform)
@@ -566,7 +596,7 @@ async def _call_grok(user_id: int, user_type: str, internal_id: int | str, conte
     messages = [{"role": "system", "content": system}] + _store.get_history(user_id)
 
     for iteration in range(_MAX_TOOL_ITER):
-        response = deps.call_model(messages)
+        response = await deps.call_model(messages)
         msg = response.choices[0].message
 
         # No tool call — Grok replied with text
@@ -636,8 +666,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = update.effective_user.id
     text    = update.message.text or ""
 
-    # Access check
-    access = _check_access(user_id)
+    # Access check — sqlite read off the event loop (Hueco H)
+    access = await asyncio.to_thread(_check_access, user_id)
     if access is None:
         await update.message.reply_text(
             "You're not registered yet. Please ask the Aquarela team for an invite link to get started."
@@ -652,7 +682,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     async with _store.lock(user_id):
         _store.append_history(user_id, "user", text)
         try:
-            reply = await _call_grok(user_id, user_type, internal_id, context, deps=_PROD_DEPS)
+            # Hueco H — presupuesto duro del turno: nunca sostener el lock
+            # del usuario más de _TURN_DEADLINE, pase lo que pase adentro.
+            async with asyncio.timeout(_TURN_DEADLINE):
+                reply = await _call_grok(user_id, user_type, internal_id, context, deps=_PROD_DEPS)
+        except TimeoutError:
+            logger.warning(f"Turn deadline of {_TURN_DEADLINE}s hit for user {user_id}")
+            reply = _TIMEOUT_REPLY
         except Exception as e:
             logger.error(f"Grok call failed for user {user_id}: {e}")
             reply = "Something went wrong on my end. Please try again in a moment."
@@ -678,28 +714,27 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     user_id = update.effective_user.id
-    access  = _check_access(user_id)
+    access  = await asyncio.to_thread(_check_access, user_id)
     if access is None:
         await query.edit_message_text("You're not registered. Please contact the Aquarela team.")
         return
 
-    lang = "en"
-    try:
-        conn = sqlite3.connect(_DB_PATH)
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT language FROM volunteers WHERE telegram_id = ?", (str(user_id),)
-        ).fetchone()
-        conn.close()
-        if row and row["language"]:
-            lang = row["language"]
-    except Exception as e:
-        logger.error(f"Could not load language for {user_id}: {e}")
+    lang = await asyncio.to_thread(_load_volunteer_language, user_id)
 
-    result = handle_training_callback(
+    # Hueco H — el core de training es puro y SÍNCRONO, y su run_tool_fn hace
+    # trabajo de subprocess (hasta 30s): la máquina de estados entera corre en
+    # un hilo del pool. Las invocaciones al engine se puentean de vuelta al
+    # event loop para compartir el runner (y su semáforo) con el loop agéntico.
+    loop = asyncio.get_running_loop()
+
+    def _run_tool_from_thread(name: str, args: dict) -> str:
+        return asyncio.run_coroutine_threadsafe(_run_tool(name, args), loop).result()
+
+    result = await asyncio.to_thread(
+        handle_training_callback,
         callback_data=data,
         acting_telegram_id=str(user_id),
-        run_tool_fn=_run_tool,
+        run_tool_fn=_run_tool_from_thread,
         load_admin_ids_fn=_load_admin_ids,
         lang=lang,
     )
@@ -717,7 +752,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     elif action in ("completed", "pending", "error"):
         await query.edit_message_text(result["reply_text"])
         if result.get("notify_admins") and result.get("admin_message"):
-            admin_ids = _load_admin_ids()
+            admin_ids = await asyncio.to_thread(_load_admin_ids)
             for admin_id in admin_ids:
                 try:
                     await context.bot.send_message(
@@ -733,7 +768,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main() -> None:
-    app = Application.builder().token(TOKEN).build()
+    # Hueco H: PTB procesa updates SECUENCIALMENTE por defecto
+    # (max_concurrent_updates=1) — sin esta línea, toda la migración async no
+    # cambia nada observable. 32 es una cota explícita y razonada, no el
+    # True=256 de PTB. El orden por-usuario lo garantiza el lock de Hueco G.
+    app = Application.builder().token(TOKEN).concurrent_updates(32).build()
     app.add_handler(CommandHandler("start",  handle_command))
     app.add_handler(CommandHandler("help",   handle_command))
     app.add_handler(CommandHandler("status", handle_command))

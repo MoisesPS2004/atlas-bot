@@ -20,7 +20,7 @@ tests construct fake deps directly (no bot.* patching, no network).
 """
 import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, AsyncMock
+from unittest.mock import MagicMock, AsyncMock
 
 import pytest
 
@@ -44,8 +44,8 @@ def _llm_response(tool_calls=None, content=None):
 
 
 def _make_call_model(*responses):
-    """Fake deps.call_model: yields each fake LLM response in order, one per agentic-loop turn."""
-    return Mock(side_effect=list(responses))
+    """Fake deps.call_model (async since Hueco H): yields each fake LLM response in order, one per agentic-loop turn."""
+    return AsyncMock(side_effect=list(responses))
 
 
 def _make_perform(**responses):

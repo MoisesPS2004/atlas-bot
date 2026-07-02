@@ -23,7 +23,8 @@ SECURITY CONTRACT agreed during the alignment phase ("Grill Me", Session 7):
      ("Jean-Paul" is a valid name).
   4. Frontier enforcement — on any invalid arg, _run_tool returns an
      {"ok": false, "error": "invalid argument: ..."} JSON and NEVER reaches
-     subprocess.run. Valid args flow through, sanitized, to argv.
+     the engine runner (subprocess.run before Hueco H; the async
+     EngineRunner since). Valid args flow through, sanitized, to argv.
   5. Pass-through — fields _run_tool does not itself pass raw into argv (e.g.
      'confirmed', coerced to the literal "true"/"false" in cmd_map) are left
      untouched by the sanitizer.
@@ -196,45 +197,46 @@ def test_sanitize_tool_args_does_not_mutate_input():
     assert original == {"volunteer_id": 7}
 
 
-# ─── 8. _run_tool frontier: invalid args never reach subprocess ─────────────────
+# ─── 8. _run_tool frontier: invalid args never reach the engine runner ──────────
 
 @pytest.fixture
-def no_subprocess(monkeypatch):
-    """Any call to subprocess.run inside bot is a contract violation for the
-    invalid-input path — blow up loudly if the frontier lets it through."""
-    def _boom(*a, **kw):
-        raise AssertionError(f"subprocess.run must not be reached: {a!r}")
-    monkeypatch.setattr(bot.subprocess, "run", _boom)
+def no_engine(monkeypatch):
+    """Any engine invocation is a contract violation for the invalid-input
+    path — blow up loudly if the frontier lets it through. (Seam: since
+    Hueco H the process boundary is bot._ENGINE.run, not subprocess.run.)"""
+    async def _boom(argv, **kw):
+        raise AssertionError(f"the engine runner must not be reached: {argv!r}")
+    monkeypatch.setattr(bot._ENGINE, "run", _boom)
 
 
-def test_run_tool_rejects_flag_injection_before_subprocess(no_subprocess):
+@pytest.mark.asyncio
+async def test_run_tool_rejects_flag_injection_before_subprocess(no_engine):
     # The canonical attack from the Hueco D diagnosis: a flag smuggled into 'week'.
-    out = json.loads(bot._run_tool("generate_draft", {"week": "--data"}))
+    out = json.loads(await bot._run_tool("generate_draft", {"week": "--data"}))
     assert out["ok"] is False
     assert "invalid argument" in out["error"]
 
 
-def test_run_tool_rejects_nonpositive_volunteer_id_before_subprocess(no_subprocess):
-    out = json.loads(bot._run_tool("deactivate_volunteer", {"volunteer_id": "-1"}))
+@pytest.mark.asyncio
+async def test_run_tool_rejects_nonpositive_volunteer_id_before_subprocess(no_engine):
+    out = json.loads(await bot._run_tool("deactivate_volunteer", {"volunteer_id": "-1"}))
     assert out["ok"] is False
     assert "invalid argument" in out["error"]
 
 
-def test_run_tool_passes_sanitized_argv_for_valid_input(monkeypatch):
-    """Valid args flow through to subprocess with the sanitized value in argv,
-    and no stray flag tokens where a datum is expected."""
+@pytest.mark.asyncio
+async def test_run_tool_passes_sanitized_argv_for_valid_input(monkeypatch):
+    """Valid args flow through to the engine runner with the sanitized value
+    in argv, and no stray flag tokens where a datum is expected."""
     captured = {}
 
-    class _Result:
-        stdout = '{"ok": true}'
-
-    def _fake_run(argv, *a, **kw):
+    async def _fake_run(argv, **kw):
         captured["argv"] = argv
-        return _Result()
+        return '{"ok": true}'
 
-    monkeypatch.setattr(bot.subprocess, "run", _fake_run)
+    monkeypatch.setattr(bot._ENGINE, "run", _fake_run)
 
-    out = json.loads(bot._run_tool("show_schedule", {"week": "2026-07-01"}))
+    out = json.loads(await bot._run_tool("show_schedule", {"week": "2026-07-01"}))
     assert out["ok"] is True
     assert "2026-07-01" in captured["argv"]
     # argparse contract: the only option-looking token is the known flag name.

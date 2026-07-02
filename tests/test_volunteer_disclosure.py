@@ -15,7 +15,7 @@ inspeccionan deps.perform.call_args — mismo idiom que test_access_control.py.
 """
 import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, AsyncMock
+from unittest.mock import MagicMock, AsyncMock
 
 import pytest
 
@@ -38,7 +38,7 @@ def _llm_response(tool_calls=None, content=None):
 
 def _make_deps(*responses, perform_result='{"ok": true}'):
     return bot.Deps(
-        call_model=Mock(side_effect=list(responses)),
+        call_model=AsyncMock(side_effect=list(responses)),  # async desde Hueco H
         perform=AsyncMock(return_value=perform_result),
     )
 
