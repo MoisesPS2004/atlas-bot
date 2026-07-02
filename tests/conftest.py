@@ -12,9 +12,10 @@ os.environ.setdefault("ATLAS_BOT_TOKEN",        "fake-token")
 os.environ.setdefault("OPENROUTER_API_KEY",     "fake-key")
 os.environ.setdefault("MOISES_TELEGRAM_ID",     "8632082731")
 
-# ── 2. Stub openai so OpenAI(...) doesn't reach the network ─────────────────
+# ── 2. Stub openai so OpenAI(...)/AsyncOpenAI(...) don't reach the network ──
 _fake_openai = types.ModuleType("openai")
 _fake_openai.OpenAI = MagicMock(return_value=MagicMock())
+_fake_openai.AsyncOpenAI = MagicMock(return_value=MagicMock())
 sys.modules.setdefault("openai", _fake_openai)
 
 # ── 3. Stub python-telegram-bot ─────────────────────────────────────────────

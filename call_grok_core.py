@@ -217,10 +217,10 @@ class Deps(NamedTuple):
     el shape (0 I/O) — las implementaciones reales viven en bot.py, las
     fakes/mocks deterministas viven en los tests.
 
-    call_model(messages) -> response
+    call_model(messages) -> response (awaitable)
         Única vía por la que el loop agéntico llega a la API del modelo.
-        Sync, misma firma que el SDK (el driver ya no llama a _client
-        directamente).
+        Async desde Hueco H (AsyncOpenAI); el driver hace await. El SDK ya
+        no se llama directamente (_client vive detrás de esta frontera).
 
     perform(tool_name, tool_args, context, acting_user_id) -> str (awaitable)
         Única vía por la que el loop dispara un efecto real: Telegram
